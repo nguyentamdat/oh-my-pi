@@ -528,7 +528,7 @@ $("t-retry").addEventListener("click", () => {
 $("t-issue").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") $("t-triage").click();
 });
-$("main").addEventListener("click", (ev) => {
+document.querySelector("main").addEventListener("click", (ev) => {
   const btn = ev.target.closest("button[data-retry]");
   if (!btn) return;
   postTrigger({ mode: "retry", delivery_id: btn.dataset.retry });

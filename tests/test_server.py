@@ -72,6 +72,8 @@ def test_index_serves_dashboard_html(settings: Settings) -> None:
     assert "api/logs" in resp.text
     assert "Retry latest run" in resp.text
     assert "current issue events" in resp.text
+    assert 'document.querySelector("main").addEventListener' in resp.text
+    assert '$("main").addEventListener' not in resp.text
 
 
 def test_api_status_reports_runtime_counts_and_inflight(settings: Settings) -> None:
