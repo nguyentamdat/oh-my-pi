@@ -1200,38 +1200,6 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					progress.inflightTaskDetails = undefined;
 				}
 
-				if (event.toolName === "yield") {
-					if (event.isError) {
-						consecutiveYieldToolErrors++;
-						let yieldErrorText = "";
-						const resultContent = event.result?.content;
-						if (Array.isArray(resultContent)) {
-							const textParts: string[] = [];
-							for (const block of resultContent) {
-								if (
-									block &&
-									typeof block === "object" &&
-									"type" in block &&
-									block.type === "text" &&
-									"text" in block &&
-									typeof block.text === "string"
-								) {
-									textParts.push(block.text);
-								}
-							}
-							yieldErrorText = textParts.join("\n").trim();
-						}
-						if (consecutiveYieldToolErrors >= MAX_YIELD_TOOL_ERRORS) {
-							const suffix = yieldErrorText ? ` Last yield error: ${yieldErrorText}` : "";
-							failWithError(
-								`Subagent submitted invalid yield results ${consecutiveYieldToolErrors} times; stopping to avoid an infinite submit loop.${suffix}`,
-							);
-						}
-					} else {
-						consecutiveYieldToolErrors = 0;
-					}
-				}
-
 				// Check for registered subagent tool handler
 				const handler = subprocessToolRegistry.getHandler(event.toolName);
 				const eventArgs = (event as { args?: Record<string, unknown> }).args ?? {};
@@ -1277,6 +1245,37 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 						})
 					) {
 						requestAbort("terminate");
+					}
+				}
+				if (event.toolName === "yield") {
+					if (event.isError && !yieldCalled && !abortSent) {
+						consecutiveYieldToolErrors++;
+						let yieldErrorText = "";
+						const resultContent = event.result?.content;
+						if (Array.isArray(resultContent)) {
+							const textParts: string[] = [];
+							for (const block of resultContent) {
+								if (
+									block &&
+									typeof block === "object" &&
+									"type" in block &&
+									block.type === "text" &&
+									"text" in block &&
+									typeof block.text === "string"
+								) {
+									textParts.push(block.text);
+								}
+							}
+							yieldErrorText = textParts.join("\n").trim();
+						}
+						if (consecutiveYieldToolErrors >= MAX_YIELD_TOOL_ERRORS) {
+							const suffix = yieldErrorText ? ` Last yield error: ${yieldErrorText}` : "";
+							failWithError(
+								`Subagent submitted invalid yield results ${consecutiveYieldToolErrors} times; stopping to avoid an infinite submit loop.${suffix}`,
+							);
+						}
+					} else if (!event.isError) {
+						consecutiveYieldToolErrors = 0;
 					}
 				}
 				flushProgress = true;
