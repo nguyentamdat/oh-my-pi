@@ -852,7 +852,12 @@ export class EventController {
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();
 			if (settings.get("display.showTokenUsage") && assistantUsageIsBilled(event.message.usage)) {
 				this.ctx.chatContainer.addChild(
-					createUsageRowBlock(event.message.usage, event.message.duration, event.message.ttft),
+					createUsageRowBlock(
+						event.message.usage,
+						event.message.duration,
+						event.message.ttft,
+						event.message.timestamp,
+					),
 				);
 			}
 			this.ctx.streamingComponent = undefined;
