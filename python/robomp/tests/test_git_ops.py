@@ -122,6 +122,7 @@ def test_fetch_ref_forwards_configured_timeout(monkeypatch, tmp_path: Path) -> N
     captured: dict[str, object] = {}
 
     def fake_run_git(*args, **kwargs):
+        captured["args"] = args
         captured.update(kwargs)
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
@@ -130,3 +131,4 @@ def test_fetch_ref_forwards_configured_timeout(monkeypatch, tmp_path: Path) -> N
     git_ops.fetch_ref(tmp_path, "main", token=None, timeout=300.0)
 
     assert captured["timeout"] == 300.0
+    assert "--depth=1" in captured["args"][0]
