@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import robomp.git_ops as git_ops
 from robomp.git_ops import _TOKEN_SAFE_CONFIG, _token_url_safe_config
 
 _AUTH_URL = "https://github.com/octo/widget.git"
@@ -115,3 +116,17 @@ def test_token_config_never_blanks_ca_locations() -> None:
     blob = " ".join((*_TOKEN_SAFE_CONFIG, *_token_url_safe_config(_AUTH_URL))).lower()
     assert "sslcainfo=" not in blob
     assert "sslcapath=" not in blob
+
+
+def test_fetch_ref_forwards_configured_timeout(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_git(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(git_ops, "_run_git", fake_run_git)
+
+    git_ops.fetch_ref(tmp_path, "main", token=None, timeout=300.0)
+
+    assert captured["timeout"] == 300.0

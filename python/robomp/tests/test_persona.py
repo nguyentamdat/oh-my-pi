@@ -180,7 +180,7 @@ def test_review_completion_reminder_mentions_submit_only() -> None:
         workspace=_Workspace(branch="review/pr-99"),
     )
     assert "submit_pr_review" in out
-    assert "gh_open_pr" not in out
+    assert "forge_open_change" not in out
 
 
 def test_completion_reminder_limits_mark_unable_to_reporter_details() -> None:
@@ -213,7 +213,7 @@ def test_system_append_routes_push_refusal_to_maintainer_comment_only() -> None:
         workspace=_Workspace(),
         bot_login="Svitter",
     )
-    assert "Push refused for reasons you cannot resolve? Ask the maintainer via `gh_post_comment`." in out
+    assert "Push refused for reasons you cannot resolve? Ask the maintainer via `forge_post_comment`." in out
     assert "or use `mark_unable_to_reproduce`" not in out
 
 

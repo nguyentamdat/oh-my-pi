@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 from functools import cache
 from pathlib import Path
 from typing import Literal
@@ -32,11 +33,27 @@ class Settings(BaseSettings):
     # the orchestrator then talks to gh-proxy over HMAC RPC and never sees
     # the PAT. Validated end-to-end in `_validate_proxy_or_pat` below.
     github_token: SecretStr | None = Field(None, alias="GITHUB_TOKEN")
-    github_webhook_secret: SecretStr = Field(..., alias="GITHUB_WEBHOOK_SECRET")
-    bot_login: str = Field(..., alias="ROBOMP_BOT_LOGIN")
+    github_webhook_secret: SecretStr | None = Field(None, alias="GITHUB_WEBHOOK_SECRET")
+    bot_login: str = Field("", alias="ROBOMP_BOT_LOGIN")
     git_author_name: str | None = Field(None, alias="ROBOMP_GIT_AUTHOR_NAME")
     git_author_email: str = Field(..., alias="ROBOMP_GIT_AUTHOR_EMAIL")
     repo_allowlist_raw: str = Field("", alias="ROBOMP_REPO_ALLOWLIST")
+    github_instance_id: str = Field("github-main", alias="ROBOMP_GITHUB_INSTANCE_ID")
+
+    # Optional GitLab ingress. Keeping the secret in SecretStr ensures it is
+    # never exposed by Settings repr/model dumps.
+    gitlab_instance_id: str = Field("gitlab-zingplay", alias="ROBOMP_GITLAB_INSTANCE_ID")
+    gitlab_base_url: str | None = Field(None, alias="ROBOMP_GITLAB_BASE_URL")
+    # Proxy-only credential. The orchestrator is deliberately rejected if it
+    # receives this variable; `load_proxy_settings()` is the only loader that
+    # may materialize it for the credential-holding proxy process.
+    gitlab_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_TOKEN")
+    gitlab_webhook_secret: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_WEBHOOK_SECRET")
+    gitlab_project_ids_raw: str = Field("", alias="ROBOMP_GITLAB_PROJECT_IDS")
+    gitlab_bot_login: str = Field("", alias="ROBOMP_GITLAB_BOT_LOGIN")
+    # Only labeled GitLab issues begin automated work. This is intentionally
+    # non-secret so ingress may receive it while the PAT stays in the proxy.
+    gitlab_trigger_label: str = Field("roboomp", alias="ROBOMP_GITLAB_TRIGGER_LABEL")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
     # PR review trigger. "open" (default) reviews incoming PRs on
     # opened/reopened/ready_for_review. "vouched_label" DEFERS review until the
@@ -91,7 +108,7 @@ class Settings(BaseSettings):
     event_max_retries: int = Field(3, alias="ROBOMP_EVENT_MAX_RETRIES")
     event_retry_delays_raw: str = Field("30,120,600", alias="ROBOMP_EVENT_RETRY_DELAYS_SECONDS")
     # Premature-end reminder. When a `triage_issue` turn ends without the
-    # agent having reached a terminal tool (`gh_open_pr`,
+    # agent having reached a terminal tool (`forge_open_change`,
     # `mark_unable_to_reproduce`, `abort_task`) for a `bug`/`documentation`
     # classification, the driver sends up to this many "you stopped before
     # opening a PR — continue" reminder prompts into the same omp session.
@@ -160,14 +177,51 @@ class Settings(BaseSettings):
     natives_cache_max_bytes: int = Field(4 * 1024**3, alias="ROBOMP_NATIVES_CACHE_MAX_BYTES")
     natives_cache_gc_interval_seconds: float = Field(3600.0, alias="ROBOMP_NATIVES_CACHE_GC_INTERVAL_SECONDS")
 
+    @field_validator("github_instance_id", "gitlab_instance_id", mode="after")
+    @classmethod
+    def _require_instance_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", cleaned):
+            raise ValueError("forge instance IDs must use only A-Z, a-z, 0-9, dot, underscore, or hyphen")
+        return cleaned
+
+    @field_validator("gitlab_base_url", mode="before")
+    @classmethod
+    def _blank_gitlab_url_disables(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().rstrip("/") or None
+        return value
+
+    @field_validator("github_webhook_secret", "gitlab_webhook_secret", "gitlab_token", mode="before")
+    @classmethod
+    def _blank_forge_secret_disables(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if hasattr(value, "get_secret_value"):
+            inner = value.get_secret_value()  # type: ignore[attr-defined]
+            if isinstance(inner, str) and not inner.strip():
+                return None
+        return value
+
+    @field_validator("gitlab_bot_login", mode="after")
+    @classmethod
+    def _normalize_gitlab_bot_login(cls, value: str) -> str:
+        return value.strip().removeprefix("@").lower()
+
+    @field_validator("gitlab_trigger_label", mode="after")
+    @classmethod
+    def _require_gitlab_trigger_label(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("ROBOMP_GITLAB_TRIGGER_LABEL must be non-empty")
+        return cleaned
+
     @field_validator("bot_login", mode="after")
     @classmethod
-    def _require_bot_login(cls, value: str) -> str:
+    def _normalize_bot_login(cls, value: str) -> str:
         cleaned = value.strip().removeprefix("@").lower()
         if cleaned.endswith("[bot]"):
             cleaned = cleaned[:-5]
-        if not cleaned:
-            raise ValueError("ROBOMP_BOT_LOGIN must be a non-empty GitHub login")
         return cleaned
 
     @field_validator("replay_token", mode="before")
@@ -216,6 +270,19 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def _validate_github_ingress(self) -> Settings:
+        ingress_configured = (
+            self.github_webhook_secret is not None,
+            bool(self.bot_login),
+            bool(self.repo_allowlist),
+        )
+        if any(ingress_configured) and not all(ingress_configured):
+            raise ValueError(
+                "GITHUB_WEBHOOK_SECRET, ROBOMP_BOT_LOGIN, and ROBOMP_REPO_ALLOWLIST must all be set together."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_proxy_or_pat(self) -> Settings:
         """Enforce mutual exclusion between PAT and proxy mode.
 
@@ -244,6 +311,30 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_gitlab(self) -> Settings:
+        ingress_configured = (
+            self.gitlab_base_url is not None,
+            self.gitlab_webhook_secret is not None,
+            bool(self.gitlab_project_ids),
+        )
+        if any(ingress_configured) and not all(ingress_configured):
+            raise ValueError(
+                "ROBOMP_GITLAB_BASE_URL, ROBOMP_GITLAB_WEBHOOK_SECRET, and "
+                "ROBOMP_GITLAB_PROJECT_IDS must all be set together."
+            )
+        if all(ingress_configured) and not self.gitlab_bot_login:
+            raise ValueError("ROBOMP_GITLAB_BOT_LOGIN must be set when GitLab ingress is enabled.")
+        if self.gitlab_token is not None:
+            raise ValueError("ROBOMP_GITLAB_TOKEN is proxy-only; configure it only for `python -m robomp.proxy serve`.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_distinct_forge_instances(self) -> Settings:
+        if self.gitlab_enabled and self.github_instance_id == self.gitlab_instance_id:
+            raise ValueError("GitHub and GitLab instance IDs must be distinct")
+        return self
+
     @field_validator("repo_allowlist_raw", mode="before")
     @classmethod
     def _coerce_allowlist(cls, v: object) -> str:
@@ -259,6 +350,43 @@ class Settings(BaseSettings):
     def repo_allowlist(self) -> frozenset[str]:
         items = [piece.strip().lower() for piece in self.repo_allowlist_raw.split(",")]
         return frozenset(item for item in items if item)
+
+    @field_validator("gitlab_project_ids_raw", mode="before")
+    @classmethod
+    def _coerce_gitlab_project_ids(cls, value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return ",".join(str(item) for item in value)
+        return str(value)
+
+    @property
+    def gitlab_project_ids(self) -> frozenset[int]:
+        project_ids: set[int] = set()
+        for piece in self.gitlab_project_ids_raw.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                project_id = int(piece)
+            except ValueError as exc:
+                raise ValueError(f"invalid GitLab project ID: {piece!r}") from exc
+            if project_id <= 0:
+                raise ValueError(f"GitLab project IDs must be positive: {project_id}")
+            project_ids.add(project_id)
+        return frozenset(project_ids)
+
+    @property
+    def gitlab_enabled(self) -> bool:
+        """Whether GitLab webhook ingress is configured."""
+        return self.gitlab_base_url is not None
+
+    @property
+    def gitlab_proxy_enabled(self) -> bool:
+        """Whether this credential-holding proxy may serve GitLab requests."""
+        return self.gitlab_token is not None and self.gitlab_base_url is not None and bool(self.gitlab_project_ids)
 
     @field_validator("rate_limit_unlimited_raw", mode="before")
     @classmethod
@@ -306,8 +434,7 @@ class Settings(BaseSettings):
     @property
     def maintainer_logins(self) -> frozenset[str]:
         items = [
-            piece.strip().lstrip("@").lower().removesuffix("[bot]")
-            for piece in self.maintainer_logins_raw.split(",")
+            piece.strip().lstrip("@").lower().removesuffix("[bot]") for piece in self.maintainer_logins_raw.split(",")
         ]
         return frozenset(item for item in items if item)
 
@@ -398,8 +525,11 @@ class _ProxyEnvLoader(BaseSettings):
         case_sensitive=False,
     )
 
-    github_token: SecretStr = Field(..., alias="GITHUB_TOKEN")
+    github_token: SecretStr | None = Field(None, alias="GITHUB_TOKEN")
     gh_proxy_hmac_key: SecretStr = Field(..., alias="ROBOMP_GH_PROXY_HMAC_KEY")
+    gitlab_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_TOKEN")
+    gitlab_base_url: str | None = Field(None, alias="ROBOMP_GITLAB_BASE_URL")
+    gitlab_project_ids_raw: str = Field("", alias="ROBOMP_GITLAB_PROJECT_IDS")
     gh_proxy_bind_host: str = Field("0.0.0.0", alias="ROBOMP_GH_PROXY_BIND_HOST")
     gh_proxy_bind_port: int = Field(8081, alias="ROBOMP_GH_PROXY_BIND_PORT")
     workspace_root: Path = Field(Path("./data/workspaces"), alias="ROBOMP_WORKSPACE_ROOT")
@@ -407,7 +537,7 @@ class _ProxyEnvLoader(BaseSettings):
     gh_proxy_max_body_bytes: int = Field(1 << 20, alias="ROBOMP_GH_PROXY_MAX_BODY_BYTES")
     gh_proxy_git_timeout_seconds: float = Field(60.0, alias="ROBOMP_GH_PROXY_GIT_TIMEOUT_SECONDS")
 
-    @field_validator("github_token", "gh_proxy_hmac_key", mode="before")
+    @field_validator("gh_proxy_hmac_key", mode="before")
     @classmethod
     def _reject_blank(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -417,6 +547,51 @@ class _ProxyEnvLoader(BaseSettings):
             if isinstance(inner, str) and not inner.strip():
                 raise ValueError("must be a non-empty string")
         return value
+
+    @field_validator("github_token", mode="before")
+    @classmethod
+    def _blank_github_token_disables(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if hasattr(value, "get_secret_value"):
+            inner = value.get_secret_value()  # type: ignore[attr-defined]
+            if isinstance(inner, str) and not inner.strip():
+                return None
+        return value
+
+    @field_validator("gitlab_token", mode="before")
+    @classmethod
+    def _blank_gitlab_token_disables(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        if hasattr(value, "get_secret_value"):
+            inner = value.get_secret_value()  # type: ignore[attr-defined]
+            if isinstance(inner, str) and not inner.strip():
+                return None
+        return value
+
+    @field_validator("gitlab_base_url", mode="before")
+    @classmethod
+    def _blank_gitlab_base_url_disables(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().rstrip("/") or None
+        return value
+
+    @field_validator("gitlab_project_ids_raw", mode="before")
+    @classmethod
+    def _coerce_proxy_gitlab_project_ids(cls, value: object) -> str:
+        return Settings._coerce_gitlab_project_ids(value)
+
+    @model_validator(mode="after")
+    def _validate_gitlab_proxy(self) -> _ProxyEnvLoader:
+        project_ids = Settings.model_construct(gitlab_project_ids_raw=self.gitlab_project_ids_raw).gitlab_project_ids
+        if self.gitlab_token is not None and (self.gitlab_base_url is None or not project_ids):
+            raise ValueError(
+                "ROBOMP_GITLAB_TOKEN requires ROBOMP_GITLAB_BASE_URL and ROBOMP_GITLAB_PROJECT_IDS in the proxy."
+            )
+        if self.github_token is None and self.gitlab_token is None:
+            raise ValueError("proxy requires GITHUB_TOKEN or ROBOMP_GITLAB_TOKEN")
+        return self
 
 
 def load_proxy_settings() -> Settings:
@@ -436,6 +611,9 @@ def load_proxy_settings() -> Settings:
         git_author_email="gh-proxy@invalid",
         gh_proxy_url=None,
         gh_proxy_hmac_key=loader.gh_proxy_hmac_key,
+        gitlab_token=loader.gitlab_token,
+        gitlab_base_url=loader.gitlab_base_url,
+        gitlab_project_ids_raw=loader.gitlab_project_ids_raw,
         gh_proxy_bind_host=loader.gh_proxy_bind_host,
         gh_proxy_bind_port=loader.gh_proxy_bind_port,
         workspace_root=loader.workspace_root,

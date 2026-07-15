@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from robomp.config import Settings, reset_settings_cache
+from robomp.config import Settings, load_proxy_settings, reset_settings_cache
 
 
 def test_settings_load_from_env(env: dict[str, str]) -> None:
@@ -64,6 +64,96 @@ def test_allowlist_csv_parsing(monkeypatch: pytest.MonkeyPatch, env: dict[str, s
     assert cfg.repo_allowlist == frozenset({"alpha/one", "beta/two", "gamma/three"})
 
 
+def test_gitlab_config_parses_project_ids_without_exposing_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.zingplay.com/")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "test-gitlab-secret")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356, 357,356")
+    monkeypatch.setenv("ROBOMP_GITLAB_BOT_LOGIN", "@RoboMP")
+    cfg = Settings()  # type: ignore[call-arg]
+
+    assert cfg.gitlab_enabled
+    assert cfg.gitlab_base_url == "https://gitlab.zingplay.com"
+    assert cfg.gitlab_project_ids == frozenset({356, 357})
+    assert cfg.gitlab_bot_login == "robomp"
+    assert "test-gitlab-secret" not in repr(cfg)
+    assert cfg.gitlab_trigger_label == "roboomp"
+
+
+def test_gitlab_proxy_token_is_rejected_by_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.setenv("ROBOMP_GITLAB_TOKEN", "glpat-never-in-orchestrator")
+    reset_settings_cache()
+    with pytest.raises(ValidationError, match="proxy-only"):
+        Settings()  # type: ignore[call-arg]
+
+
+def test_proxy_loader_enables_gitlab_only_with_proxy_token(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN")
+    monkeypatch.setenv("ROBOMP_GITLAB_TOKEN", "glpat_proxy_only")
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.example.test/")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356")
+    cfg = load_proxy_settings()
+
+    assert cfg.github_token is None
+    assert cfg.gitlab_proxy_enabled
+    assert cfg.gitlab_token is not None
+    assert cfg.gitlab_token.get_secret_value() == "glpat_proxy_only"
+    assert cfg.gitlab_base_url == "https://gitlab.example.test"
+    assert cfg.gitlab_project_ids == frozenset({356})
+
+
+def test_gitlab_config_rejects_partial_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.zingplay.com")
+    with pytest.raises(ValueError, match="must all be set together"):
+        Settings()  # type: ignore[call-arg]
+
+
+def test_gitlab_config_requires_bot_login(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.zingplay.com")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356")
+    monkeypatch.delenv("ROBOMP_GITLAB_BOT_LOGIN", raising=False)
+    with pytest.raises(ValueError, match="ROBOMP_GITLAB_BOT_LOGIN"):
+        Settings()  # type: ignore[call-arg]
+
+
+def test_orchestrator_config_allows_gitlab_without_github_ingress(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")
+    monkeypatch.setenv("ROBOMP_BOT_LOGIN", "")
+    monkeypatch.setenv("ROBOMP_REPO_ALLOWLIST", "")
+    monkeypatch.setenv("ROBOMP_GH_PROXY_URL", "http://proxy.test")
+    monkeypatch.setenv("ROBOMP_GH_PROXY_HMAC_KEY", "h" * 32)
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.zingplay.com")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "gitlab-secret")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356")
+    monkeypatch.setenv("ROBOMP_GITLAB_BOT_LOGIN", "roboomp")
+
+    cfg = Settings()  # type: ignore[call-arg]
+
+    assert cfg.github_webhook_secret is None
+    assert cfg.bot_login == ""
+    assert cfg.repo_allowlist == frozenset()
+    assert cfg.gitlab_enabled
+
+
 def test_blank_replay_token_treated_as_disabled(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
     monkeypatch.setenv("ROBOMP_REPLAY_TOKEN", "")
     reset_settings_cache()
@@ -113,9 +203,7 @@ def test_bot_login_normalizes_mention_case_and_app_suffix(
     assert cfg.bot_login == "roboomp"
 
 
-def test_maintainer_logins_normalize_csv_entries(
-    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
-) -> None:
+def test_maintainer_logins_normalize_csv_entries(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
     monkeypatch.setenv("ROBOMP_MAINTAINER_LOGINS", " can1357, @ROBOOMP , @Alice[bot] ,, ")
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]

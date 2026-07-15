@@ -113,7 +113,7 @@ def _make_inputs(
     repo = SimpleNamespace(full_name="acme/widgets", owner="acme", name="widgets")
     issue = SimpleNamespace(repo="acme/widgets", number=1, title="bug")
 
-    db = SimpleNamespace(set_event_model=lambda _did, _model: None, get_issue=lambda _key: None)
+    db = SimpleNamespace(set_event_model=lambda _did, _model, **_kwargs: None, get_issue=lambda _key: None)
     github = SimpleNamespace()
 
     inputs = worker.TaskInputs(
@@ -260,6 +260,8 @@ async def test_run_rpc_omits_continue_when_session_empty(
     assert client_kwargs["env"]["HOME"] == str(agent_home)
     assert client_kwargs["env"]["GITHUB_TOKEN"] == ""
     assert client_kwargs["env"]["GITHUB_WEBHOOK_SECRET"] == ""
+    assert client_kwargs["env"]["ROBOMP_GITLAB_WEBHOOK_SECRET"] == ""
+    assert client_kwargs["env"]["ROBOMP_GITLAB_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_REPLAY_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
     assert client_kwargs["user"] is None
@@ -318,6 +320,8 @@ async def test_run_rpc_omits_home_when_agent_home_absent(
     assert "HOME" not in client_kwargs["env"]
     assert client_kwargs["env"]["GITHUB_TOKEN"] == ""
     assert client_kwargs["env"]["GITHUB_WEBHOOK_SECRET"] == ""
+    assert client_kwargs["env"]["ROBOMP_GITLAB_WEBHOOK_SECRET"] == ""
+    assert client_kwargs["env"]["ROBOMP_GITLAB_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_REPLAY_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
 
@@ -635,11 +639,11 @@ async def test_run_rpc_sends_reminder_when_pr_class_quits_early(tmp_path: Path, 
 
 @pytest.mark.asyncio
 async def test_run_rpc_stops_reminding_after_terminal_tool(tmp_path: Path, settings: Settings) -> None:
-    """A reminder turn that fires `gh_open_pr` halts the loop."""
+    """A reminder turn that fires `forge_open_change` halts the loop."""
     inputs, bindings = _make_inputs_with_classification(tmp_path, settings, classification="bug")
 
     # First turn returns with no terminal tool; first reminder causes the
-    # agent to "call" gh_open_pr — simulated by mutating the worker's
+    # agent to "call" forge_open_change — simulated by mutating the worker's
     # tools_called set via the on_prompt hook on the next prompt.
     def _on_prompt(client: _FakeRpcClient, prompt: str) -> None:
         if len(client.prompts) == 2:  # this is the first reminder
@@ -650,7 +654,7 @@ async def test_run_rpc_stops_reminding_after_terminal_tool(tmp_path: Path, setti
             # driver registers the callback before prompt_and_wait, so we
             # replay it here.
             for cb in client._tool_end_callbacks:
-                cb(SimpleNamespace(tool_name="gh_open_pr", result={}))
+                cb(SimpleNamespace(tool_name="forge_open_change", result={}))
 
     # Capture the registered tool_end callback on the fake.
     original_on_tool_end = _FakeRpcClient.on_tool_execution_end
@@ -678,7 +682,7 @@ async def test_run_rpc_stops_reminding_after_terminal_tool(tmp_path: Path, setti
         delattr(_FakeRpcClient, "on_prompt")
 
     fake = _FakeRpcClient.instances[0]
-    # kickoff + 1 reminder; second reminder NOT sent because gh_open_pr fired.
+    # kickoff + 1 reminder; second reminder NOT sent because forge_open_change fired.
     assert len(fake.prompts) == 2, fake.prompts
 
 
@@ -738,7 +742,7 @@ async def test_run_rpc_review_pr_reminds_until_submit_pr_review(tmp_path: Path, 
     assert len(fake.prompts) == 1 + settings.task_completion_max_reminders
     assert fake.prompts[0] == "kickoff"
     assert all("submit_pr_review" in p for p in fake.prompts[1:])
-    assert all("gh_open_pr" not in p for p in fake.prompts[1:])
+    assert all("forge_open_change" not in p for p in fake.prompts[1:])
 
 
 @pytest.mark.asyncio

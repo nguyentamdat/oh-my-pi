@@ -5,7 +5,7 @@ Branch: `{{workspace.branch}}`
 
 You classified this issue and reproduced the bug, but did NOT reach a turn-ending action. Acceptable turn-ending actions for a `bug` / `documentation` issue are exactly one of:
 
-1. `gh_push_branch` + `gh_open_pr` — you committed the fix, pushed the branch, and opened a PR.
+1. `forge_push_branch` + `forge_open_change` — you committed the fix, pushed the branch, and opened a PR.
 2. `mark_unable_to_reproduce` — you genuinely cannot reproduce after a real attempt and need reporter-provided reproduction details.
 3. `abort_task` — unrecoverable environment failure.
 

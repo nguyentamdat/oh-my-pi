@@ -35,14 +35,14 @@ Maintainer **@{{directive.author}}** tagged you. Their directive is authoritativ
 1. **Classify first.** You MUST call `classify_issue(primary=..., priority=..., functional=[...], rationale=...)` before any other side effect, even if the directive states the answer. Labels are how the rest of the org sees triage.
 
 2. **Execute the directive** in the same session on `{{workspace.branch}}`:
-   - **Code change** → commit on `{{workspace.branch}}`, then `gh_push_branch` + `gh_open_pr`. Both run `bun run fix` then `bun check` against the worktree; if `bun check` fails, fix the cause and call again. PR body uses the four-section template verbatim: `## Repro` / `## Cause` / `## Fix` / `## Verification`. Reply with a single `gh_post_comment` linking the PR.
-   - **Question / clarification** → one `gh_post_comment`. No branch, no PR.
-   - **Explicit stop / ignore** → one `gh_post_comment` acknowledging, then halt.
+   - **Code change** → commit on `{{workspace.branch}}`, then `forge_push_branch` + `forge_open_change`. Both run `bun run fix` then `bun check` against the worktree; if `bun check` fails, fix the cause and call again. PR body uses the four-section template verbatim: `## Repro` / `## Cause` / `## Fix` / `## Verification`. Reply with a single `forge_post_comment` linking the PR.
+   - **Question / clarification** → one `forge_post_comment`. No branch, no PR.
+   - **Explicit stop / ignore** → one `forge_post_comment` acknowledging, then halt.
 
-3. **Ambiguous directive** → one clarifying `gh_post_comment` and stop. NEVER guess.
+3. **Ambiguous directive** → one clarifying `forge_post_comment` and stop. NEVER guess.
 
 ---
 
-All side effects MUST go through `gh_*` / `classify_issue` / `set_issue_labels`. NEVER shell out to `gh` or `git push`.
+All side effects MUST use `forge_*`, `classify_issue`, or `set_issue_labels`. NEVER shell out to a forge CLI or `git push`.
 
 Terse. Technical. No emoji.

@@ -6,18 +6,27 @@ import asyncio
 import logging
 import os
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 
 from robomp import tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
+from robomp.forge import ForgeEvent
 from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class ForgeRuntime:
+    backend: GitHubBackend
+    sandbox: SandboxManager
+    git_transport: GitTransport
 
 
 class WorkerPool:
@@ -32,12 +41,14 @@ class WorkerPool:
         sandbox: SandboxManager,
         git_transport: GitTransport,
         slot_pool: SlotPool | None = None,
+        forge_runtime_factories: Mapping[str, Callable[[EventRow], ForgeRuntime]] | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
         self.github = github
         self.sandbox = sandbox
         self.git_transport = git_transport
+        self.forge_runtime_factories = dict(forge_runtime_factories or {})
         self._workers: list[asyncio.Task[None]] = []
         self._wakeup = asyncio.Event()
         self._stop = asyncio.Event()
@@ -200,7 +211,7 @@ class WorkerPool:
                     continue
                 # Schedule the task; the slot pool caps concurrent execution.
                 task = asyncio.create_task(self._run_event(row), name=f"robomp-event-{row.delivery_id[:8]}")
-                self._inflight_tasks[task] = row.delivery_id
+                self._inflight_tasks[task] = row.dispatch_id
                 task.add_done_callback(lambda t: self._inflight_tasks.pop(t, None))
         except asyncio.CancelledError:
             raise
@@ -208,17 +219,22 @@ class WorkerPool:
             log.exception("dispatch loop crashed")
 
     async def _claim_next_unique(self) -> EventRow | None:
-        """Claim the next event whose issue isn't already inflight."""
-        # The DB layer doesn't filter by issue_key; we peek then guard with a set.
+        """Claim the next event whose canonical work item isn't already inflight."""
+        # SQLite enforces this across processes; the set closes the in-process
+        # gap between claim and task scheduling.
         async with self._inflight_lock:
             # Naive but fine for v1 (small queue).
             row = await asyncio.to_thread(self.db.claim_next_event)
             if row is None:
                 return None
-            key = row.issue_key or row.delivery_id
+            key = row.queue_key
             if key in self._inflight:
-                # Put it back; another in-flight task is touching the same issue.
-                await asyncio.to_thread(self.db.requeue_event, row.delivery_id, from_states=("running",))
+                await asyncio.to_thread(
+                    self.db.requeue_event,
+                    row.delivery_id,
+                    from_states=("running",),
+                    instance_id=row.instance_id,
+                )
                 # Sleep briefly so we don't spin.
                 await asyncio.sleep(0.5)
                 return None
@@ -226,7 +242,7 @@ class WorkerPool:
         return row
 
     async def _release(self, row: EventRow) -> None:
-        key = row.issue_key or row.delivery_id
+        key = row.queue_key
         async with self._inflight_lock:
             self._inflight.discard(key)
 
@@ -269,7 +285,7 @@ class WorkerPool:
         return True
 
     async def _run_event(self, row: EventRow) -> None:
-        token = set_current_event(self, row.delivery_id)
+        token = set_current_event(self, row.dispatch_id)
         slot_uid: int | None = None
         slot_acquired = False
         try:
@@ -283,7 +299,7 @@ class WorkerPool:
             else:
                 await self._dispatch_and_mark(row)
         except Exception as exc:
-            if row.delivery_id in self._shutdown_cancelled:
+            if row.dispatch_id in self._shutdown_cancelled:
                 # `stop()` deliberately interrupted this delivery —
                 # leave the row in `running` so `reset_stuck_running()`
                 # flips it back to `queued` on the next start and the
@@ -296,16 +312,24 @@ class WorkerPool:
                     "event interrupted by shutdown",
                     extra={"delivery": row.delivery_id, "key": row.issue_key},
                 )
-            elif row.delivery_id in self._cancelled:
+            elif row.dispatch_id in self._cancelled:
                 log.info("event cancelled", extra={"delivery": row.delivery_id})
-                self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
+                self.db.mark_event(
+                    row.delivery_id,
+                    "failed",
+                    error="cancelled by operator",
+                    instance_id=row.instance_id,
+                )
             else:
                 tb = traceback.format_exc(limit=20)
                 err = f"{exc}\n{tb}"
                 max_retries = self.settings.event_max_retries
                 delay = self.settings.retry_delay_seconds(row.attempts)
                 if 0 < row.attempts <= max_retries and self.db.schedule_retry(
-                    row.delivery_id, delay_seconds=delay, error=err
+                    row.delivery_id,
+                    delay_seconds=delay,
+                    error=err,
+                    instance_id=row.instance_id,
                 ):
                     log.warning(
                         "event retry scheduled",
@@ -319,11 +343,11 @@ class WorkerPool:
                     )
                 else:
                     log.exception("event handler failed", extra={"delivery": row.delivery_id})
-                    self.db.mark_event(row.delivery_id, "failed", error=err)
+                    self.db.mark_event(row.delivery_id, "failed", error=err, instance_id=row.instance_id)
         finally:
-            self._cancelled.discard(row.delivery_id)
-            self._shutdown_cancelled.discard(row.delivery_id)
-            self._cancel_hooks.pop(row.delivery_id, None)
+            self._cancelled.discard(row.dispatch_id)
+            self._shutdown_cancelled.discard(row.dispatch_id)
+            self._cancel_hooks.pop(row.dispatch_id, None)
             if slot_acquired and self._slot_pool is not None:
                 try:
                     _reap_slot(slot_uid)
@@ -334,26 +358,99 @@ class WorkerPool:
 
     async def _dispatch_and_mark(self, row: EventRow, *, slot_uid: int | None = None) -> None:
         await self._dispatch(row, slot_uid=slot_uid)
-        if row.delivery_id in self._cancelled:
-            self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
+        if row.dispatch_id in self._cancelled:
+            self.db.mark_event(
+                row.delivery_id,
+                "failed",
+                error="cancelled by operator",
+                instance_id=row.instance_id,
+            )
         else:
-            self.db.mark_event(row.delivery_id, "done")
+            self.db.mark_event(row.delivery_id, "done", instance_id=row.instance_id)
+
+    async def _dispatch_forge(self, row: EventRow, *, slot_uid: int | None = None) -> None:
+        if row.repository_id is None:
+            raise RuntimeError("canonical forge event has no repository id")
+        factory = self.forge_runtime_factories.get(row.instance_id)
+        if factory is None:
+            raise RuntimeError(f"no runtime for forge instance {row.instance_id}")
+        runtime = factory(row)
+        event = ForgeEvent.from_dict(row.payload)
+        if event.item.key != row.canonical_key or event.delivery_id != row.delivery_id:
+            raise RuntimeError("persisted forge event identity mismatch")
+        if event.task_kind == "triage_issue":
+            await tasks.triage_issue(
+                settings=self.settings,
+                db=self.db,
+                github=runtime.backend,
+                sandbox=runtime.sandbox,
+                git_transport=runtime.git_transport,
+                forge_event=event,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
+            return
+        if event.task_kind == "handle_comment":
+            await tasks.handle_comment(
+                settings=self.settings,
+                db=self.db,
+                github=runtime.backend,
+                sandbox=runtime.sandbox,
+                git_transport=runtime.git_transport,
+                forge_event=event,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
+            return
+        if event.task_kind == "cleanup_workspace":
+            await asyncio.to_thread(
+                runtime.sandbox.remove_workspace,
+                repo=event.item.repository.full_name,
+                number=event.item.number,
+                instance_id=event.item.repository.instance_id,
+                repository_id=event.item.repository.remote_id,
+                item_kind=event.item.kind,
+            )
+            if self.db.get_issue(event.item.key) is not None:
+                self.db.set_issue_state(event.item.key, "closed")
+            return
+        raise RuntimeError(f"unsupported forge task: {event.task_kind}")
 
     async def _dispatch(self, row: EventRow, *, slot_uid: int | None = None) -> None:
+        if row.instance_id != self.settings.github_instance_id:
+            await self._dispatch_forge(row, slot_uid=slot_uid)
+            return
         event = row.event_type
         action = str(row.payload.get("action") or "")
+        task_kind = row.task_kind
+        if task_kind is None:
+            if event == "issues" and action == "opened":
+                task_kind = "triage_issue"
+            elif event == "issue_comment" and action == "created":
+                issue = row.payload.get("issue") or {}
+                task_kind = "handle_pr_conversation" if "pull_request" in issue else "handle_comment"
+            elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled"):
+                task_kind = "review_change"
+            elif event == "pull_request_review_comment" and action == "created":
+                task_kind = "handle_review"
+            elif (event == "issues" or event == "pull_request") and action == "closed":
+                task_kind = "cleanup_workspace"
+
         log.info(
             "dispatch",
             extra={
                 "event": event,
                 "action": action,
+                "task_kind": task_kind,
                 "delivery": row.delivery_id,
-                "key": row.issue_key,
+                "key": row.queue_key,
                 "attempts": row.attempts,
                 "recovered": row.attempts >= 2,
             },
         )
-        if event == "issues" and action == "opened":
+        if task_kind == "triage_issue":
             await tasks.triage_issue(
                 settings=self.settings,
                 db=self.db,
@@ -365,33 +462,31 @@ class WorkerPool:
                 attempts=row.attempts,
                 slot_uid=slot_uid,
             )
-        elif event == "issue_comment" and action == "created":
-            issue = row.payload.get("issue") or {}
-            if "pull_request" in issue:
-                await tasks.handle_pr_conversation(
-                    settings=self.settings,
-                    db=self.db,
-                    github=self.github,
-                    sandbox=self.sandbox,
-                    git_transport=self.git_transport,
-                    payload=row.payload,
-                    delivery_id=row.delivery_id,
-                    attempts=row.attempts,
-                    slot_uid=slot_uid,
-                )
-            else:
-                await tasks.handle_comment(
-                    settings=self.settings,
-                    db=self.db,
-                    github=self.github,
-                    sandbox=self.sandbox,
-                    git_transport=self.git_transport,
-                    payload=row.payload,
-                    delivery_id=row.delivery_id,
-                    attempts=row.attempts,
-                    slot_uid=slot_uid,
-                )
-        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled"):
+        elif task_kind == "handle_pr_conversation":
+            await tasks.handle_pr_conversation(
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                git_transport=self.git_transport,
+                payload=row.payload,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
+        elif task_kind == "handle_comment":
+            await tasks.handle_comment(
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                git_transport=self.git_transport,
+                payload=row.payload,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
+        elif task_kind in {"review_change", "review_pr"}:
             await tasks.review_pr(
                 settings=self.settings,
                 db=self.db,
@@ -403,7 +498,7 @@ class WorkerPool:
                 attempts=row.attempts,
                 slot_uid=slot_uid,
             )
-        elif event == "pull_request_review_comment" and action == "created":
+        elif task_kind == "handle_review":
             await tasks.handle_review(
                 settings=self.settings,
                 db=self.db,
@@ -415,17 +510,11 @@ class WorkerPool:
                 attempts=row.attempts,
                 slot_uid=slot_uid,
             )
-        elif event == "issues" and action == "closed":
-            await tasks.cleanup_workspace(
-                settings=self.settings,
-                db=self.db,
-                sandbox=self.sandbox,
-                payload=row.payload,
-                target_state="closed",
-            )
-        elif event == "pull_request" and action == "closed":
-            pr = row.payload.get("pull_request") or {}
-            target_state = "merged" if bool(pr.get("merged")) else "closed"
+        elif task_kind == "cleanup_workspace":
+            target_state = "merged" if row.canonical_event == "change.merged" else "closed"
+            if row.canonical_event is None and event == "pull_request":
+                pr = row.payload.get("pull_request") or {}
+                target_state = "merged" if bool(pr.get("merged")) else "closed"
             await tasks.cleanup_workspace(
                 settings=self.settings,
                 db=self.db,

@@ -12,9 +12,9 @@ decision a one-glance call.
 Run two phases in order. Phase 1 is cheap and always happens; Phase 2 is the real review.
 
 <critical>
-- **Read-only.** No `gh_push_branch`, no `gh_open_pr`, no commits, no `git push`. The only
+- **Read-only.** No `forge_push_branch`, no `forge_open_change`, no commits, no `git push`. The only
   side effects are `classify_pr`, `pr_review_comment`, `submit_pr_review`, and (if a
-  maintainer must decide something) one `gh_post_comment`.
+  maintainer must decide something) one `forge_post_comment`.
 - **Phase 1 before Phase 2.** `classify_pr` is the first side effect. Rank and tag before
   you write a single inline comment.
 - **One review, batched.** Stage every inline finding with `pr_review_comment`, then flush

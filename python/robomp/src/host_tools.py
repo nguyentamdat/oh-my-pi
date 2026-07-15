@@ -37,7 +37,6 @@ from robomp.sandbox import (
     _slot_subprocess_kwargs,
     rename_workspace_branch,
     validate_branch_slug,
-    workspace_key,
 )
 
 log = logging.getLogger(__name__)
@@ -48,6 +47,8 @@ _BUN_INSTALL_TIMEOUT_SECONDS = 300.0
 _REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "GITHUB_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_TOKEN",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
@@ -99,10 +100,12 @@ class ToolBindings:
     loop: asyncio.AbstractEventLoop
     author_name: str
     author_email: str
+    item_key: str | None = None
+    supports_question_autoclose: bool = True
     settings: Settings | None = None
     # Number of the GitHub thread the inbound webhook arrived on. For an
     # issue comment this is the issue; for a PR conversation or review
-    # comment it's the PR. `gh_post_comment` defaults its target here so
+    # comment it's the PR. `forge_post_comment` defaults its target here so
     # the agent's reply lands on the thread the human is actually reading.
     # `None` for tasks with no inbound thread (e.g. initial triage), in
     # which case the originating issue is used.
@@ -126,7 +129,7 @@ class ToolBindings:
 
     @property
     def issue_key(self) -> str:
-        return issue_key(self.issue.repo, self.issue.number)
+        return self.item_key or issue_key(self.issue.repo, self.issue.number)
 
     @property
     def default_comment_number(self) -> int:
@@ -365,7 +368,7 @@ def _run_pre_publish_bun_fix(
 
     `tool_name` is the host tool calling this (audit attribution).
     `stage` is the human-readable verb used in error wording — "open PR"
-    when called from `gh_open_pr`, "push" when called from `gh_push_branch`.
+    when called from `forge_open_change`, "push" when called from `forge_push_branch`.
 
     `skip_checks` is the agent-supplied escape hatch: when True, the
     formatter is NOT invoked and any post-fix commit is skipped, so a
@@ -536,6 +539,8 @@ def _should_schedule_autoclose(bindings: ToolBindings, target_number: int) -> fl
     classified as `question`, and the issue is not already in a terminal or
     waiting-for-reporter state.
     """
+    if not bindings.supports_question_autoclose:
+        return None
     settings = bindings.settings
     if settings is None or not settings.question_autoclose_enabled:
         return None
@@ -581,12 +586,12 @@ def _schedule_autoclose(bindings: ToolBindings, *, comment_id: int, hours: float
     return close_at
 
 
-# ---------- gh_post_comment ----------
+# ---------- forge_post_comment ----------
 def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         body = args.get("body")
         if not isinstance(body, str) or not body.strip():
-            _raise_command("gh_post_comment requires a non-empty 'body'.")
+            _raise_command("forge_post_comment requires a non-empty 'body'.")
         target_number = bindings.default_comment_number
         if isinstance(args.get("number"), int):
             target_number = int(args["number"])
@@ -603,8 +608,8 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
                 bindings.github.post_comment(bindings.repo.full_name, target_number, body_to_post),
             )
         except GitHubError as exc:
-            _audit(bindings, "gh_post_comment", args, error=str(exc))
-            _raise_command(f"GitHub rejected comment: {exc.status} {exc.message}")
+            _audit(bindings, "forge_post_comment", args, error=str(exc))
+            _raise_command(f"Forge rejected comment: {exc.status} {exc.message}")
         audit_result: dict[str, Any] = {"comment_id": comment.id}
         if schedule_close is not None:
             scheduled_at = _schedule_autoclose(
@@ -614,22 +619,22 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
             if scheduled_at is not None:
                 audit_result["scheduled_close_at"] = scheduled_at
-        _audit(bindings, "gh_post_comment", args, result=audit_result)
+        _audit(bindings, "forge_post_comment", args, result=audit_result)
         return f"comment posted: id={comment.id}"
 
     return host_tool(
-        name="gh_post_comment",
-        description=persona.host_tool_description("gh_post_comment"),
+        name="forge_post_comment",
+        description=persona.host_tool_description("forge_post_comment"),
         parameters={
             "type": "object",
             "properties": {
                 "body": {
                     "type": "string",
-                    "description": persona.host_tool_parameter_description("gh_post_comment", "body"),
+                    "description": persona.host_tool_parameter_description("forge_post_comment", "body"),
                 },
                 "number": {
                     "type": "integer",
-                    "description": persona.host_tool_parameter_description("gh_post_comment", "number"),
+                    "description": persona.host_tool_parameter_description("forge_post_comment", "number"),
                 },
             },
             "required": ["body"],
@@ -838,7 +843,7 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
     try:
         result = bindings.git_transport.push_branch(
             repo=bindings.repo.full_name,
-            workspace_key=workspace_key(bindings.repo.full_name, bindings.issue.number),
+            workspace_key=bindings.workspace.workspace_key,
             repo_dir=repo_dir_path,
             branch=branch,
             expected_head=head_sha,
@@ -864,40 +869,40 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
     return result.head
 
 
-# ---------- gh_push_branch ----------
+# ---------- forge_push_branch ----------
 def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         if bindings.review_mode:
             msg = "refusing to push: PR review worktrees are read-only."
-            _audit(bindings, "gh_push_branch", args, error=msg)
+            _audit(bindings, "forge_push_branch", args, error=msg)
             _raise_command(msg)
-        _enforce_impl_authorization(bindings, "gh_push_branch", args, action="push branch")
+        _enforce_impl_authorization(bindings, "forge_push_branch", args, action="push branch")
         branch = str(args.get("branch") or bindings.workspace.branch)
         skip = bool(args.get("skip_checks", False))
-        # Same gate as gh_open_pr — formatter + check before bytes leave the
+        # Same gate as forge_open_change — formatter + check before bytes leave the
         # workstation, so CI doesn't blow up on a follow-up commit. The fix
         # pass auto-commits any formatter diff so the push includes it.
         # `skip_checks=true` bypasses the formatter/check (e.g. when `main`
         # itself is broken); dirty-tree gate still runs unconditionally.
-        _run_pre_publish_bun_fix(bindings, args, tool_name="gh_push_branch", stage="push", skip_checks=skip)
-        _run_pre_publish_bun_check(bindings, args, tool_name="gh_push_branch", stage="push", skip_checks=skip)
-        head = _guarded_push_branch(bindings, args, "gh_push_branch", branch)
+        _run_pre_publish_bun_fix(bindings, args, tool_name="forge_push_branch", stage="push", skip_checks=skip)
+        _run_pre_publish_bun_check(bindings, args, tool_name="forge_push_branch", stage="push", skip_checks=skip)
+        head = _guarded_push_branch(bindings, args, "forge_push_branch", branch)
         suffix = " (pre-push checks skipped)" if skip else ""
         return f"pushed {branch} at {head[:12]} as {bindings.author_name} <{bindings.author_email}>{suffix}"
 
     return host_tool(
-        name="gh_push_branch",
-        description=persona.host_tool_description("gh_push_branch"),
+        name="forge_push_branch",
+        description=persona.host_tool_description("forge_push_branch"),
         parameters={
             "type": "object",
             "properties": {
                 "branch": {
                     "type": "string",
-                    "description": persona.host_tool_parameter_description("gh_push_branch", "branch"),
+                    "description": persona.host_tool_parameter_description("forge_push_branch", "branch"),
                 },
                 "skip_checks": {
                     "type": "boolean",
-                    "description": persona.host_tool_parameter_description("gh_push_branch", "skip_checks"),
+                    "description": persona.host_tool_parameter_description("forge_push_branch", "skip_checks"),
                 },
             },
             "additionalProperties": False,
@@ -906,20 +911,20 @@ def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
-# ---------- gh_open_pr ----------
+# ---------- forge_open_change ----------
 def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         if bindings.review_mode:
             msg = "refusing to open PR: PR review tasks are read-only."
-            _audit(bindings, "gh_open_pr", args, error=msg)
+            _audit(bindings, "forge_open_change", args, error=msg)
             _raise_command(msg)
-        _enforce_impl_authorization(bindings, "gh_open_pr", args, action="open PR")
+        _enforce_impl_authorization(bindings, "forge_open_change", args, action="open PR")
         title = args.get("title")
         body = args.get("body")
         if not isinstance(title, str) or not title.strip():
-            _raise_command("gh_open_pr requires a non-empty 'title'.")
+            _raise_command("forge_open_change requires a non-empty 'title'.")
         if not isinstance(body, str) or not body.strip():
-            _raise_command("gh_open_pr requires a non-empty 'body'.")
+            _raise_command("forge_open_change requires a non-empty 'body'.")
         for required in ("## Repro", "## Cause", "## Fix", "## Verification"):
             if required not in body:
                 _raise_command(
@@ -937,10 +942,10 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                 "Verification section per the template."
             )
         skip = bool(args.get("skip_checks", False))
-        _run_pre_publish_bun_fix(bindings, args, tool_name="gh_open_pr", stage="open PR", skip_checks=skip)
-        _run_pre_publish_bun_check(bindings, args, tool_name="gh_open_pr", stage="open PR", skip_checks=skip)
-        # Make sure the branch is pushed (idempotent) using the same preflight as gh_push_branch.
-        _guarded_push_branch(bindings, args, "gh_open_pr", bindings.workspace.branch)
+        _run_pre_publish_bun_fix(bindings, args, tool_name="forge_open_change", stage="open PR", skip_checks=skip)
+        _run_pre_publish_bun_check(bindings, args, tool_name="forge_open_change", stage="open PR", skip_checks=skip)
+        # Make sure the branch is pushed (idempotent) using the same preflight as forge_push_branch.
+        _guarded_push_branch(bindings, args, "forge_open_change", bindings.workspace.branch)
         base = args.get("base") or bindings.repo.default_branch
         was_needs_info = _issue_needs_info(bindings)
         try:
@@ -956,8 +961,8 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                 ),
             )
         except GitHubError as exc:
-            _audit(bindings, "gh_open_pr", args, error=str(exc))
-            _raise_command(f"GitHub rejected PR: {exc.status} {exc.message}")
+            _audit(bindings, "forge_open_change", args, error=str(exc))
+            _raise_command(f"Forge rejected PR/MR: {exc.status} {exc.message}")
         bindings.db.set_issue_pr(bindings.issue_key, pr.number)
         bindings.db.set_issue_state(bindings.issue_key, "opened")
         needs_info_label_cleared = _remove_needs_info_label(bindings) if was_needs_info else False
@@ -978,28 +983,28 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
         result: dict[str, Any] = {"pr_number": pr.number, "url": pr.html_url}
         if needs_info_label_cleared:
             result["cleared_needs_info"] = True
-        _audit(bindings, "gh_open_pr", args, result=result)
+        _audit(bindings, "forge_open_change", args, result=result)
         return f"opened #{pr.number}: {pr.html_url}"
 
     return host_tool(
-        name="gh_open_pr",
-        description=persona.host_tool_description("gh_open_pr"),
+        name="forge_open_change",
+        description=persona.host_tool_description("forge_open_change"),
         parameters={
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
                 "body": {
                     "type": "string",
-                    "description": persona.host_tool_parameter_description("gh_open_pr", "body"),
+                    "description": persona.host_tool_parameter_description("forge_open_change", "body"),
                 },
                 "base": {
                     "type": "string",
-                    "description": persona.host_tool_parameter_description("gh_open_pr", "base"),
+                    "description": persona.host_tool_parameter_description("forge_open_change", "base"),
                 },
                 "draft": {"type": "boolean", "default": False},
                 "skip_checks": {
                     "type": "boolean",
-                    "description": persona.host_tool_parameter_description("gh_open_pr", "skip_checks"),
+                    "description": persona.host_tool_parameter_description("forge_open_change", "skip_checks"),
                 },
             },
             "required": ["title", "body"],
@@ -1009,17 +1014,17 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
-# ---------- gh_request_review ----------
+# ---------- forge_request_review ----------
 def _build_request_review(bindings: ToolBindings) -> HostTool[Any, Any]:
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         reviewers = args.get("reviewers") or []
         assignees = args.get("assignees") or []
         if not isinstance(reviewers, list) or not isinstance(assignees, list):
-            _raise_command("gh_request_review expects 'reviewers' and 'assignees' to be arrays of logins.")
+            _raise_command("forge_request_review expects 'reviewers' and 'assignees' to be arrays of logins.")
         issue_row = bindings.db.get_issue(bindings.issue_key)
         pr_number = issue_row.pr_number if issue_row else None
         if pr_number is None:
-            _raise_command("no PR recorded for this issue yet; call gh_open_pr first.")
+            _raise_command("no PR recorded for this issue yet; call forge_open_change first.")
         try:
             if reviewers:
                 _run_coro(
@@ -1040,14 +1045,14 @@ def _build_request_review(bindings: ToolBindings) -> HostTool[Any, Any]:
                     ),
                 )
         except GitHubError as exc:
-            _audit(bindings, "gh_request_review", args, error=str(exc))
-            _raise_command(f"GitHub rejected review request: {exc.status} {exc.message}")
-        _audit(bindings, "gh_request_review", args, result={"pr": pr_number})
+            _audit(bindings, "forge_request_review", args, error=str(exc))
+            _raise_command(f"Forge rejected review request: {exc.status} {exc.message}")
+        _audit(bindings, "forge_request_review", args, result={"pr": pr_number})
         return f"updated review/assignees on #{pr_number}"
 
     return host_tool(
-        name="gh_request_review",
-        description=persona.host_tool_description("gh_request_review"),
+        name="forge_request_review",
+        description=persona.host_tool_description("forge_request_review"),
         parameters={
             "type": "object",
             "properties": {
@@ -1140,7 +1145,7 @@ def _build_mark_unable(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
         except GitHubError as exc:
             _audit(bindings, "mark_unable_to_reproduce", args, error=str(exc))
-            _raise_command(f"GitHub rejected comment: {exc.status} {exc.message}")
+            _raise_command(f"Forge rejected comment: {exc.status} {exc.message}")
         result: dict[str, Any] = {"comment_id": comment.id, "state": "needs_info"}
         try:
             labels = _run_coro(
@@ -1291,7 +1296,7 @@ def _enforce_impl_authorization(
     msg = (
         f"refusing to {action}: issue #{bindings.issue.number} is {classification_phrase}; "
         "a repo OWNER or allowlisted maintainer must @-mention you with an explicit go-ahead "
-        "before any branch/PR. Post your analysis with `gh_post_comment` and stop."
+        "before any branch/PR. Post your analysis with `forge_post_comment` and stop."
     )
     _audit(bindings, tool_name, args, error=msg)
     _raise_command(msg)
@@ -1383,7 +1388,7 @@ def _build_classify_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
         except GitHubError as exc:
             _audit(bindings, "classify_pr", args, error=str(exc))
-            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+            _raise_command(f"Forge rejected labels: {exc.status} {exc.message}")
         bindings.db.set_issue_classification(bindings.issue_key, str(rank))
         _audit(
             bindings,
@@ -1555,7 +1560,7 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
         except GitHubError as exc:
             _audit(bindings, "submit_pr_review", args, error=str(exc))
-            _raise_command(f"GitHub rejected PR review: {exc.status} {exc.message}")
+            _raise_command(f"Forge rejected review: {exc.status} {exc.message}")
         cleared = bindings.db.clear_staged_review_comments(bindings.issue_key)
         _audit(
             bindings,
@@ -1615,7 +1620,7 @@ def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
         except GitHubError as exc:
             _audit(bindings, "set_issue_labels", args, error=str(exc))
-            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+            _raise_command(f"Forge rejected labels: {exc.status} {exc.message}")
         _audit(bindings, "set_issue_labels", args, result={"labels": list(applied)})
         return f"labels now: {', '.join(applied)}"
 
@@ -1744,7 +1749,7 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
         except GitHubError as exc:
             _audit(bindings, "classify_issue", args, error=str(exc))
-            _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+            _raise_command(f"Forge rejected labels: {exc.status} {exc.message}")
 
         bindings.db.set_issue_classification(bindings.issue_key, primary)
         _audit(

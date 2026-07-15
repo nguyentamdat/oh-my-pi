@@ -90,6 +90,9 @@ class Workspace:
     branch: str
     repo_full_name: str
     issue_number: int
+    instance_id: str = "github-main"
+    repository_id: str | None = None
+    item_kind: str = "issue"
 
     @property
     def repro_dir(self) -> Path:
@@ -97,7 +100,13 @@ class Workspace:
 
     @property
     def workspace_key(self) -> str:
-        return workspace_key(self.repo_full_name, self.issue_number)
+        return workspace_key(
+            self.repo_full_name,
+            self.issue_number,
+            instance_id=self.instance_id,
+            repository_id=self.repository_id,
+            item_kind=self.item_kind,
+        )
 
 
 def _slug(text: str, *, length: int = 40) -> str:
@@ -113,8 +122,21 @@ def _short_hex(seed: str | None = None) -> str:
     return secrets.token_hex(4)
 
 
-def workspace_key(repo: str, number: int) -> str:
-    return f"{repo.replace('/', '__')}__{number}"
+def workspace_key(
+    repo: str,
+    number: int,
+    *,
+    instance_id: str = "github-main",
+    repository_id: str | None = None,
+    item_kind: str = "issue",
+) -> str:
+    legacy = f"{repo.replace('/', '__')}__{number}"
+    if instance_id == "github-main" and repository_id is None and item_kind == "issue":
+        return legacy
+    instance = re.sub(r"[^A-Za-z0-9._-]+", "__", instance_id)
+    remote = re.sub(r"[^A-Za-z0-9._-]+", "__", repository_id or repo)
+    kind = re.sub(r"[^A-Za-z0-9._-]+", "__", item_kind)
+    return f"{instance}__{remote}__{kind}__{number}"
 
 
 def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
@@ -694,30 +716,47 @@ class SandboxManager:
         self._repo_locks: dict[str, threading.RLock] = {}
         self._repo_locks_guard = threading.Lock()
 
-    def _repo_lock(self, repo: str) -> threading.RLock:
+    def _repo_lock(
+        self,
+        repo: str,
+        *,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+    ) -> threading.RLock:
+        key = str(self.pool_path(repo, instance_id=instance_id, repository_id=repository_id))
         with self._repo_locks_guard:
-            lock = self._repo_locks.get(repo)
+            lock = self._repo_locks.get(key)
             if lock is None:
                 lock = threading.RLock()
-                self._repo_locks[repo] = lock
+                self._repo_locks[key] = lock
             return lock
 
     # ---- pool ----
-    def pool_path(self, repo: str) -> Path:
-        return self.pool / repo.replace("/", "__")
+    def pool_path(
+        self,
+        repo: str,
+        *,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+    ) -> Path:
+        if instance_id == "github-main" and repository_id is None:
+            return self.pool / repo.replace("/", "__")
+        instance = re.sub(r"[^A-Za-z0-9._-]+", "__", instance_id)
+        remote = re.sub(r"[^A-Za-z0-9._-]+", "__", repository_id or repo)
+        return self.pool / f"{instance}__{remote}"
 
-    def ensure_clone(self, *, repo: str, clone_url: str, default_branch: str) -> Path:
-        """Idempotent shared clone for `repo`.
-
-        `clone_url` MUST be a plain `https://github.com/<owner>/<repo>.git`
-        (no embedded credentials). Auth is supplied per-call by the transport.
-        """
-        target = self.pool_path(repo)
+    def ensure_clone(
+        self,
+        *,
+        repo: str,
+        clone_url: str,
+        default_branch: str,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+    ) -> Path:
+        """Idempotent shared clone for one forge repository."""
+        target = self.pool_path(repo, instance_id=instance_id, repository_id=repository_id)
         if (target / ".git").exists() or (target / "HEAD").exists():
-            # Idempotent refresh. An older deploy may have baked a
-            # credentialed `https://user:pass@github.com/...` into
-            # `.git/config`; rewrite to the credential-free URL we now own
-            # before fetching so the PAT never persists on disk.
             self._reset_origin_url(target, clone_url)
             self.transport.fetch_pool(repo=repo, pool_dir=target)
             return target
@@ -752,8 +791,22 @@ class SandboxManager:
         _safe_run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir)
 
     # ---- per-issue workspace ----
-    def workspace_root(self, repo: str, number: int) -> Path:
-        return self.root / workspace_key(repo, number)
+    def workspace_root(
+        self,
+        repo: str,
+        number: int,
+        *,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+        item_kind: str = "issue",
+    ) -> Path:
+        return self.root / workspace_key(
+            repo,
+            number,
+            instance_id=instance_id,
+            repository_id=repository_id,
+            item_kind=item_kind,
+        )
 
     def ensure_workspace(
         self,
@@ -768,13 +821,33 @@ class SandboxManager:
         author_name: str,
         author_email: str,
         slot_uid: int | None = None,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+        item_kind: str = "issue",
     ) -> Workspace:
         """Create or resume a per-issue worktree."""
-        with self._repo_lock(repo):
+        lock = (
+            self._repo_lock(repo)
+            if instance_id == "github-main" and repository_id is None
+            else self._repo_lock(repo, instance_id=instance_id, repository_id=repository_id)
+        )
+        with lock:
             if pr_head is not None and existing_branch is not None:
                 raise ValueError("ensure_workspace accepts either pr_head or existing_branch, not both")
-            pool = self.ensure_clone(repo=repo, clone_url=clone_url, default_branch=default_branch)
-            ws_root = self.workspace_root(repo, number)
+            pool = self.ensure_clone(
+                repo=repo,
+                clone_url=clone_url,
+                default_branch=default_branch,
+                instance_id=instance_id,
+                repository_id=repository_id,
+            )
+            ws_root = self.workspace_root(
+                repo,
+                number,
+                instance_id=instance_id,
+                repository_id=repository_id,
+                item_kind=item_kind,
+            )
             repo_dir = ws_root / "repo"
             session_dir = ws_root / ".omp-session"
             context_dir = ws_root / "context"
@@ -789,7 +862,7 @@ class SandboxManager:
                 or make_branch(
                     issue_number=number,
                     title=title,
-                    seed=f"{repo}#{number}",
+                    seed=f"{instance_id}:{repository_id or repo}:{item_kind}:{number}",
                 )
             )
 
@@ -893,6 +966,9 @@ class SandboxManager:
                 branch=branch,
                 repo_full_name=repo,
                 issue_number=number,
+                instance_id=instance_id,
+                repository_id=repository_id,
+                item_kind=item_kind,
             )
             # Best-effort: hardlink pre-built natives in if we've cached this
             # source state before. Runs AFTER the slot chown so the cache inode
@@ -984,11 +1060,30 @@ class SandboxManager:
                     extra={"file": str(child), "err": str(exc)},
                 )
 
-    def remove_workspace(self, *, repo: str, number: int) -> None:
-        with self._repo_lock(repo):
-            ws_root = self.workspace_root(repo, number)
+    def remove_workspace(
+        self,
+        *,
+        repo: str,
+        number: int,
+        instance_id: str = "github-main",
+        repository_id: str | None = None,
+        item_kind: str = "issue",
+    ) -> None:
+        lock = (
+            self._repo_lock(repo)
+            if instance_id == "github-main" and repository_id is None
+            else self._repo_lock(repo, instance_id=instance_id, repository_id=repository_id)
+        )
+        with lock:
+            ws_root = self.workspace_root(
+                repo,
+                number,
+                instance_id=instance_id,
+                repository_id=repository_id,
+                item_kind=item_kind,
+            )
             repo_dir = ws_root / "repo"
-            pool = self.pool_path(repo)
+            pool = self.pool_path(repo, instance_id=instance_id, repository_id=repository_id)
             # `repo_dir.exists()` is not a reliable proxy for "nothing to clean
             # up in the pool": a worktree-add or a prior remove killed mid-flight
             # can leave the checkout gone but the pool's worktree registration

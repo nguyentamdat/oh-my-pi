@@ -16,9 +16,8 @@ def _settings_or_die() -> Settings:
     """Load proxy-only settings, surfacing config errors as exit code 2.
 
     Routes through `load_proxy_settings` (NOT the orchestrator `Settings()`
-    ctor) so the gh-proxy container only needs `GITHUB_TOKEN` +
-    `ROBOMP_GH_PROXY_HMAC_KEY` — the orchestrator's webhook secret,
-    bot_login, and proxy-URL fields are irrelevant here.
+    ctor) so the credential proxy only needs at least one forge token plus
+    `ROBOMP_GH_PROXY_HMAC_KEY`; orchestrator webhook identities are irrelevant.
     """
     try:
         return load_proxy_settings()
@@ -34,14 +33,14 @@ def main() -> None:
 
 @main.command()
 def serve() -> None:
-    """Run the HMAC-authenticated GitHub proxy."""
+    """Run the HMAC-authenticated forge credential proxy."""
     cfg = _settings_or_die()
     configure_logging(cfg.log_dir)
     cfg.ensure_paths()
     # `load_proxy_settings` already rejects blank values, but stay defensive
     # in case a caller constructs the Settings by hand.
-    if cfg.github_token is None:
-        click.echo("gh-proxy: GITHUB_TOKEN is required in proxy mode", err=True)
+    if cfg.github_token is None and cfg.gitlab_token is None:
+        click.echo("forge proxy: GITHUB_TOKEN or ROBOMP_GITLAB_TOKEN is required", err=True)
         sys.exit(2)
     if cfg.gh_proxy_hmac_key is None:
         click.echo("gh-proxy: ROBOMP_GH_PROXY_HMAC_KEY is required in proxy mode", err=True)

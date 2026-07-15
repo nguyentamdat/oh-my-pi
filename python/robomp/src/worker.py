@@ -32,7 +32,7 @@ from omp_rpc import (
 from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
-from robomp.db import Database, issue_key
+from robomp.db import DEFAULT_GITHUB_INSTANCE, Database, issue_key
 from robomp.git_ops import DirtyState, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
@@ -56,6 +56,11 @@ class TaskInputs:
     issue: IssueInfo
     workspace: Workspace
     delivery_id: str
+    item_key: str | None = None
+    supports_question_autoclose: bool = True
+    bot_login: str | None = None
+    author_name: str | None = None
+    instance_id: str = DEFAULT_GITHUB_INSTANCE
     attempts: int = 0
     slot_uid: int | None = None
     natives_cache: NativesCache | None = None
@@ -113,6 +118,8 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     # `bash` tool could otherwise `printenv` them out of roboomp's env.
     "GITHUB_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_TOKEN",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
@@ -190,7 +197,7 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     return env
 
 
-_TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
+_TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"forge_open_change", "mark_unable_to_reproduce", "abort_task"})
 _TERMINAL_REVIEW_TOOLS: frozenset[str] = frozenset({"submit_pr_review", "abort_task"})
 _PR_REQUIRING_CLASSIFICATIONS: frozenset[str] = frozenset({"bug", "documentation"})
 
@@ -393,7 +400,7 @@ def _build_prompt(
         return persona.kickoff_pr_review(repo=inputs.repo, pr=pr, workspace=inputs.workspace)
     if task_kind == "handle_comment":
         assert comment is not None
-        issue_row = inputs.db.get_issue(issue_key(inputs.repo.full_name, inputs.issue.number))
+        issue_row = inputs.db.get_issue(inputs.item_key or issue_key(inputs.repo.full_name, inputs.issue.number))
         if issue_row is None:
             pr_status = "no PR opened yet"
         elif issue_row.pr_number is None:
@@ -483,7 +490,9 @@ def _run_rpc_blocking(
     rpc_env = _build_extra_env(settings)
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
     rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
-    rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
+    rpc_env.update(
+        _git_identity_env(inputs.author_name or inputs.settings.resolved_author_name, inputs.settings.git_author_email)
+    )
     # Bare worktrees have no node_modules; install (idempotently) so the agent
     # can resolve workspace packages (@oh-my-pi/pi-*) and actually run tests.
     host_tools.ensure_workspace_dependencies(bindings)
@@ -513,20 +522,20 @@ def _run_rpc_blocking(
             "pragma_thinking": thinking_override,
         },
     )
-    inputs.db.set_event_model(inputs.delivery_id, chosen_model)
+    inputs.db.set_event_model(inputs.delivery_id, chosen_model, instance_id=inputs.instance_id)
     append_system_prompt = (
         persona.system_append_pr_review(
             repo=inputs.repo,
             issue=inputs.issue,
             workspace=inputs.workspace,
-            bot_login=inputs.settings.bot_login,
+            bot_login=inputs.bot_login or inputs.settings.bot_login,
         )
         if task_kind == "review_pr"
         else persona.system_append(
             repo=inputs.repo,
             issue=inputs.issue,
             workspace=inputs.workspace,
-            bot_login=inputs.settings.bot_login,
+            bot_login=inputs.bot_login or inputs.settings.bot_login,
         )
     )
 
@@ -661,9 +670,7 @@ def _run_rpc_blocking(
                 stop_reason = turn.assistant_message.get("stopReason")
                 if stop_reason == "error":
                     error_msg = turn.assistant_message.get("errorMessage") or "model returned error"
-                    raise RuntimeError(
-                        f"omp agent error (stopReason=error): {error_msg}"
-                    )
+                    raise RuntimeError(f"omp agent error (stopReason=error): {error_msg}")
             log.info(
                 "rpc_done",
                 extra={
@@ -701,8 +708,10 @@ async def run_task(
         workspace=inputs.workspace,
         loop=loop,
         settings=inputs.settings,
-        author_name=inputs.settings.resolved_author_name,
+        author_name=inputs.author_name or inputs.settings.resolved_author_name,
         author_email=inputs.settings.git_author_email,
+        item_key=inputs.item_key,
+        supports_question_autoclose=inputs.supports_question_autoclose,
         inbound_thread_number=pr_number,
         inbound_is_pr=pr_number is not None,
         review_mode=review_mode,

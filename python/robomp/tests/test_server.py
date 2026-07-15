@@ -835,6 +835,284 @@ def _signed_headers(secret: str, body: bytes, *, event: str, delivery: str) -> d
     }
 
 
+def _gitlab_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> Settings:
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.zingplay.com")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "test-gitlab-webhook-secret")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356")
+    monkeypatch.setenv("ROBOMP_GITLAB_BOT_LOGIN", "robomp")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    return cfg
+
+
+def _gitlab_issue_body() -> bytes:
+    return json.dumps(
+        {
+            "object_kind": "issue",
+            "project": {"id": 356, "path_with_namespace": "ica/server"},
+            "user": {"id": 7, "username": "alice"},
+            "object_attributes": {
+                "iid": 42,
+                "action": "open",
+                "title": "Crash on start",
+                "description": "Steps",
+            },
+            "labels": [{"title": "roboomp"}],
+        }
+    ).encode()
+
+
+def _gitlab_note_body() -> bytes:
+    return json.dumps(
+        {
+            "object_kind": "note",
+            "project": {"id": 356, "path_with_namespace": "ica/server"},
+            "user": {"id": 8, "username": "bob"},
+            "object_attributes": {
+                "id": 99,
+                "action": "create",
+                "noteable_type": "Issue",
+                "note": "Please fix this too",
+            },
+            "issue": {"iid": 42},
+        }
+    ).encode()
+
+
+def test_gitlab_webhook_enqueues_canonical_event(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    body = _gitlab_issue_body()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook/gitlab-zingplay",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitlab-Token": "test-gitlab-webhook-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "gitlab-delivery-1",
+            },
+        )
+        event = get_database(cfg.sqlite_path).get_event(
+            "gitlab-delivery-1",
+            instance_id="gitlab-zingplay",
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "delivery": "gitlab-delivery-1",
+        "instance": "gitlab-zingplay",
+        "state": "queued",
+    }
+    assert event is not None
+    assert event.repository_id == "356"
+    assert event.item_kind == "issue"
+    assert event.item_number == 42
+    assert event.canonical_key == "gitlab-zingplay:356:issue:42"
+    assert event.canonical_event == "issue.opened"
+    assert event.task_kind == "triage_issue"
+
+
+def test_gitlab_label_activation_queues_exactly_one_task(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    payload = json.loads(_gitlab_issue_body())
+    payload["labels"] = []
+    unlabeled = json.dumps(payload).encode()
+    payload["object_attributes"]["action"] = "update"
+    payload["labels"] = [{"title": "roboomp"}]
+    payload["changes"] = {
+        "labels": {
+            "previous": [],
+            "current": [{"title": "roboomp"}],
+        }
+    }
+    activated = json.dumps(payload).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Gitlab-Token": "test-gitlab-webhook-secret",
+        "X-Gitlab-Event": "Issue Hook",
+    }
+    with TestClient(create_app(cfg)) as client:
+        skipped = client.post(
+            "/webhook/gitlab-zingplay",
+            content=unlabeled,
+            headers={**headers, "X-Gitlab-Event-UUID": "unlabeled-open"},
+        )
+        queued = client.post(
+            "/webhook/gitlab-zingplay",
+            content=activated,
+            headers={**headers, "X-Gitlab-Event-UUID": "label-added"},
+        )
+
+    db = get_database(cfg.sqlite_path)
+    rows = db._conn.execute(
+        "SELECT delivery_id FROM events WHERE canonical_key=?",
+        ("gitlab-zingplay:356:issue:42",),
+    ).fetchall()
+    assert skipped.json()["state"] == "skipped"
+    assert queued.json()["state"] == "queued"
+    assert [row["delivery_id"] for row in rows] == ["label-added"]
+
+
+def test_gitlab_event_uuid_not_webhook_uuid_is_the_delivery_key(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Gitlab-Token": "test-gitlab-webhook-secret",
+        "X-Gitlab-Event": "Issue Hook",
+        "X-Gitlab-Webhook-UUID": "same-hook",
+    }
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        first = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_issue_body(),
+            headers={**headers, "X-Gitlab-Event-UUID": "event-one"},
+        )
+        second = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_issue_body(),
+            headers={**headers, "X-Gitlab-Event-UUID": "event-two"},
+        )
+
+    db = get_database(cfg.sqlite_path)
+    assert first.status_code == second.status_code == 202
+    assert db.get_event("event-one", instance_id="gitlab-zingplay") is not None
+    assert db.get_event("event-two", instance_id="gitlab-zingplay") is not None
+
+
+def test_gitlab_note_for_unactivated_issue_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_note_body(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitlab-Token": "test-gitlab-webhook-secret",
+                "X-Gitlab-Event": "Note Hook",
+                "X-Gitlab-Event-UUID": "unactivated-note",
+            },
+        )
+
+    event = get_database(cfg.sqlite_path).get_event(
+        "unactivated-note",
+        instance_id="gitlab-zingplay",
+    )
+    assert response.status_code == 202
+    assert response.json()["state"] == "skipped"
+    assert event is not None
+    assert event.state == "skipped"
+    assert event.last_error == "work item is not activated"
+
+
+def test_gitlab_note_rate_limit_uses_instance_and_actor_id(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env).model_copy(update={"rate_limit_default": 1})
+    headers = {
+        "Content-Type": "application/json",
+        "X-Gitlab-Token": "test-gitlab-webhook-secret",
+    }
+    with TestClient(create_app(cfg)) as client:
+        client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_issue_body(),
+            headers={**headers, "X-Gitlab-Event": "Issue Hook", "X-Gitlab-Event-UUID": "activate"},
+        )
+        first = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_note_body(),
+            headers={**headers, "X-Gitlab-Event": "Note Hook", "X-Gitlab-Event-UUID": "note-one"},
+        )
+        second = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_note_body(),
+            headers={**headers, "X-Gitlab-Event": "Note Hook", "X-Gitlab-Event-UUID": "note-two"},
+        )
+
+    assert first.json()["state"] == "queued"
+    assert second.json()["state"] == "skipped"
+    event = get_database(cfg.sqlite_path).get_event("note-two", instance_id="gitlab-zingplay")
+    assert event is not None
+    assert event.last_error == "rate limited"
+
+
+def test_gitlab_webhook_rejects_invalid_token(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_issue_body(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitlab-Token": "wrong",
+                "X-Gitlab-Event-UUID": "gitlab-rejected",
+            },
+        )
+        stored = get_database(cfg.sqlite_path).get_event(
+            "gitlab-rejected",
+            instance_id="gitlab-zingplay",
+        )
+
+    assert response.status_code == 401
+    assert stored is None
+
+
+def test_github_webhook_response_and_routing_remain_compatible(settings: Settings) -> None:
+    payload = {
+        "action": "opened",
+        "issue": {
+            "number": 77,
+            "user": {"login": "alice"},
+            "author_association": "NONE",
+        },
+        "repository": {"id": 99, "full_name": "octo/widget"},
+    }
+    body = json.dumps(payload).encode()
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhook/github",
+            content=body,
+            headers=_signed_headers(
+                "test-webhook-secret",
+                body,
+                event="issues",
+                delivery="github-regression",
+            ),
+        )
+        event = get_database(settings.sqlite_path).get_event("github-regression")
+
+    assert response.status_code == 202
+    assert response.json() == {"delivery": "github-regression", "state": "queued"}
+    assert event is not None
+    assert event.instance_id == "github-main"
+    assert event.repository_id == "99"
+    assert event.canonical_key == "github-main:99:issue:77"
+    assert event.task_kind == "triage_issue"
+
+
 def _post_issue_opened(
     client: TestClient,
     *,

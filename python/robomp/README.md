@@ -81,9 +81,9 @@ roboomp's `Dockerfile.robomp` extends via `FROM ${PI_BASE}`.
 ### Public URL
 
 roboomp does not ship a tunnel. Cloudflare, smee, ngrok are all fine. The
-recommended ingress rule restricts the public hostname to
-`/webhook/github` exactly; `/healthz`, `/events`, `/issues`, `/replay`
-stay localhost-only.
+recommended ingress rule exposes only configured webhook routes:
+`/webhook/github` and/or `/webhook/gitlab-zingplay`. `/healthz`, `/events`,
+`/issues`, `/replay`, and `/api/*` stay localhost-only.
 
 ### GitHub webhook
 
@@ -92,6 +92,48 @@ type `application/json`, secret = `GITHUB_WEBHOOK_SECRET`, events =
 *Issues, Issue comments, Pull requests, Pull request reviews, Pull
 request review comments*. GitHub's `ping` should produce
 `POST /webhook/github 202` within a second.
+
+### GitLab webhook — `gitlab.zingplay.com/ica/server`
+
+The first GitLab target is immutable project ID `356` (`ica/server`) on
+GitLab `17.5.5-ee`. Configure the orchestrator with:
+
+```dotenv
+ROBOMP_GITLAB_BASE_URL=https://gitlab.zingplay.com
+ROBOMP_GITLAB_PROJECT_IDS=356
+ROBOMP_GITLAB_BOT_LOGIN=<service-account-login>
+ROBOMP_GITLAB_TRIGGER_LABEL=roboomp
+ROBOMP_GITLAB_WEBHOOK_SECRET=<random-webhook-secret>
+```
+
+Configure the credential-proxy container—not the orchestrator—with a
+project/group access token:
+
+```dotenv
+ROBOMP_GITLAB_TOKEN=<project-or-group-access-token>
+```
+
+The token needs project membership that can create/push `roboomp/*` branches,
+comment and label issues, and open merge requests. Use GitLab scopes `api` and
+`write_repository`; never grant admin or `sudo`. The token MUST NOT be present
+in the roboomp orchestrator or agent environment.
+
+In *Settings → Webhooks* for project `356`:
+
+- URL: `https://<robomp-host>/webhook/gitlab-zingplay`
+- Secret token: same value as `ROBOMP_GITLAB_WEBHOOK_SECRET`
+- Enable: **Issues events**, **Comments**
+- Content type: JSON
+
+GitLab `17.5` uses `X-Gitlab-Token`; the receiver compares it in constant time.
+Only issues carrying the `roboomp` label are admitted. A later label-added
+Issue Hook activates an existing issue. Note Hooks resume only an already
+activated item; bot, system, internal, empty, and unrelated notes are ignored.
+Allowlisting uses numeric project ID `356`, never `ica/server` alone.
+
+Validate a deployment with a test issue: add `roboomp`, observe one queued
+event, one `roboomp/*` branch, one merge request, and a final issue comment.
+Re-delivery of the same event UUID MUST NOT create a second merge request.
 
 ### Configuration
 
@@ -145,18 +187,18 @@ The integration test spawns a real `omp --mode rpc` against an
 - `git` errors flow through `git_ops.GitCommandError` which redacts
   `https://user:pw@host` to `https://***@host` from argv, stdout, stderr
   before raising. `host_tools._audit` only records agent-supplied args.
-- Pre-push gates (`gh_push_branch`): branch matches the workspace
+- Pre-push gates (`forge_push_branch`): branch matches the workspace
   branch, working tree clean, every commit on
   `origin/<default>..HEAD` carries `ROBOMP_GIT_AUTHOR_NAME` +
   `ROBOMP_GIT_AUTHOR_EMAIL`. Commit messages carrying shell-literal
   `\n` escapes (agents quoting `git commit -m 'a\n\nb'`) are rewritten
   to real newlines — message-only, trees/identities/dates preserved.
-- Pre-PR gates (`gh_open_pr`): when the repo defines them, `bun run fix`
+- Pre-PR gates (`forge_open_change`): when the repo defines them, `bun run fix`
   runs first (any diff amended into the agent's HEAD commit — no
   standalone `style:` noise commits) and then
   `bun check`. A failing `bun check` returns to the agent as
   `RpcCommandError` for iteration.
-- `gh_open_pr` validates `## Repro` / `## Cause` / `## Fix` /
+- `forge_open_change` validates `## Repro` / `## Cause` / `## Fix` /
   `## Verification` headers and a `Fixes`/`Closes`/`Resolves #N`
   reference before opening.
 
@@ -187,8 +229,8 @@ The integration test spawns a real `omp --mode rpc` against an
 | Container exits with `PI_ROOT … missing` | `/work/pi` mount empty inside the container; on the host either run `docker compose` from `python/robomp/` so `PI_ROOT` defaults to `../..`, or export `PI_ROOT` to a valid oh-my-pi checkout. |
 | `git push: Authentication required` | Bot PAT lacks push, or `ROBOMP_BOT_LOGIN` does not identify the PAT account's mention handle (production: `roboomp`, no `@`/`[bot]`). |
 | `refusing to push: commit author identity mismatch` | Some commit not authored as `ROBOMP_GIT_AUTHOR_*`. The error lists the offending shas; `git commit --amend --reset-author --no-edit`. |
-| `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `gh_open_pr`, which auto-commits `bun run fix` output. |
-| `bun check failed before PR creation` | Fix the reported failure and retry `gh_open_pr`. |
+| `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `forge_open_change`, which auto-commits `bun run fix` output. |
+| `bun check failed before PR creation` | Fix the reported failure and retry `forge_open_change`. |
 | `Failed to load pi_natives` | Wrong arch / missing native. `bun run pi:image` then `bun run robomp:build`. |
 | `No API key found for <provider>` | `~/.omp/agent/models.container.yml` mount missing or provider id mismatch with `ROBOMP_MODEL`. |
 
@@ -201,8 +243,8 @@ src/
   queue.py           WorkerPool, dispatch loop, per-issue _inflight serialization
   tasks.py           triage_issue, handle_comment, handle_pr_conversation, handle_review, cleanup_workspace
   worker.py          synchronous omp RPC driver, prompt assembly, env scrubbing
-  host_tools.py      classify_issue, set_issue_labels, gh_post_comment, repro_record,
-                     gh_push_branch, gh_open_pr, gh_request_review,
+  host_tools.py      classify_issue, set_issue_labels, forge_post_comment, repro_record,
+                     forge_push_branch, forge_open_change, forge_request_review,
                      mark_unable_to_reproduce, abort_task, fetch_issue_thread
   sandbox.py         clone pool + worktree lifecycle
   github_client.py   typed httpx client; webhook payload parsing

@@ -25,6 +25,68 @@ def test_record_event_dedupes_by_delivery(db: Database) -> None:
     )
 
 
+def test_event_identity_allows_same_delivery_and_local_number_across_instances(db: Database) -> None:
+    for instance_id in ("github-main", "gitlab-zingplay"):
+        assert db.record_event(
+            instance_id=instance_id,
+            delivery_id="same-delivery",
+            event_type="Issue Hook",
+            canonical_event="issue.opened",
+            task_kind="triage_issue",
+            repo="ica/server",
+            repository_id="356",
+            item_kind="issue",
+            item_number=42,
+            issue_key=f"{instance_id}:356:issue:42",
+            payload={"object_kind": "issue"},
+        )
+
+    github = db.get_event("same-delivery", instance_id="github-main")
+    gitlab = db.get_event("same-delivery", instance_id="gitlab-zingplay")
+    assert github is not None and gitlab is not None
+    assert github.canonical_key == "github-main:356:issue:42"
+    assert gitlab.canonical_key == "gitlab-zingplay:356:issue:42"
+
+    first = db.claim_next_event()
+    second = db.claim_next_event()
+    assert first is not None and second is not None
+    assert {first.instance_id, second.instance_id} == {"github-main", "gitlab-zingplay"}
+
+
+def test_activated_item_requires_non_skipped_activation(db: Database) -> None:
+    key = "gitlab-zingplay:356:issue:42"
+    assert not db.has_activated_item(key)
+    db.record_event(
+        instance_id="gitlab-zingplay",
+        delivery_id="skipped",
+        event_type="Issue Hook",
+        canonical_event="issue.opened",
+        task_kind="triage_issue",
+        repo="ica/server",
+        repository_id="356",
+        item_kind="issue",
+        item_number=42,
+        issue_key=key,
+        payload={},
+        state="skipped",
+    )
+    assert not db.has_activated_item(key)
+    db.record_event(
+        instance_id="gitlab-zingplay",
+        delivery_id="accepted",
+        event_type="Issue Hook",
+        canonical_event="issue.opened",
+        task_kind="triage_issue",
+        repo="ica/server",
+        repository_id="356",
+        item_kind="issue",
+        item_number=42,
+        issue_key=key,
+        payload={},
+    )
+    assert db.has_activated_item(key)
+
+
 def test_claim_next_event_singleton_under_contention(db: Database) -> None:
     for i in range(5):
         db.record_event(
@@ -257,7 +319,7 @@ def test_log_tool_call(db: Database) -> None:
     db.upsert_issue(key="octo/widget#1", repo="octo/widget", number=1, state="new")
     row_id = db.log_tool_call(
         issue_key="octo/widget#1",
-        tool="gh_post_comment",
+        tool="forge_post_comment",
         args={"body": "hi"},
         result={"comment_id": 9},
     )
@@ -357,6 +419,12 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
           tool TEXT, args_json TEXT, result_json TEXT, error TEXT, ts TEXT);
         INSERT INTO issues VALUES ('octo/widget#1', 'octo/widget', 1, 'farm/x', '/tmp/s', NULL,
           'reproducing', '2026-01-01T00:00:00Z');
+        INSERT INTO events VALUES (
+          'legacy-delivery', 'issues',
+          '{"action":"opened","repository":{"id":99},"issue":{"number":1}}',
+          '2026-01-01T00:00:00Z', 'queued', 0, NULL, 'octo/widget', 'octo/widget#1',
+          NULL, NULL
+        );
         """
     )
     conn.commit()
@@ -368,6 +436,14 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
     assert row.classification is None  # column exists, default NULL
     database.set_issue_classification("octo/widget#1", "bug")
     assert database.get_issue("octo/widget#1").classification == "bug"
+    event = database.get_event("legacy-delivery")
+    assert event is not None
+    assert event.instance_id == "github-main"
+    assert event.repository_id == "99"
+    assert event.item_kind == "issue"
+    assert event.item_number == 1
+    assert event.task_kind == "triage_issue"
+    assert event.canonical_key == "github-main:99:issue:1"
     database.close()
 
 
@@ -416,7 +492,7 @@ def test_list_running_events_surfaces_last_tool_since_start(db: Database) -> Non
     assert running[0]["last_tool"] is None
     assert running[0]["last_tool_ts"] is None
     # New tool call after start → surfaces in the snapshot.
-    db.log_tool_call(issue_key=key, tool="gh_post_comment", args={"body": "hi"})
+    db.log_tool_call(issue_key=key, tool="forge_post_comment", args={"body": "hi"})
     db.log_tool_call(issue_key=key, tool="set_issue_labels", args={"labels": ["bug"]})
     running = db.list_running_events()
     assert running[0]["last_tool"] == "set_issue_labels"  # latest by ts

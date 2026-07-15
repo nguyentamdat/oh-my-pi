@@ -52,6 +52,8 @@ _GIT_SUBPROCESS_SCRUBBED_ENV_KEYS = (
     "GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_TOKEN",
+    "ROBOMP_GITLAB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
@@ -65,7 +67,6 @@ def _git_subprocess_env() -> dict[str, str]:
     env["GIT_ASKPASS"] = ""
     env["SSH_ASKPASS"] = ""
     return env
-
 
 
 # git matches `http.<url>.*` / `credential.<url>.*` against the FULL request
@@ -566,6 +567,7 @@ def fetch_ref(
     remote_url: str | None = None,
     auth_url: str | None = None,
     safe_directory: Path | None = None,
+    timeout: float | None = None,
 ) -> None:
     """Fetch ``<ref>`` from origin AND materialize every reachable blob locally.
 
@@ -598,6 +600,7 @@ def fetch_ref(
         auth_url=auth_url,
         extra_env=_explicit_remote_env(remote_url, cwd=repo_dir),
         safe_directory=safe_directory,
+        timeout=timeout,
     )
     if proc.returncode != 0:
         log.debug(

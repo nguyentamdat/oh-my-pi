@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -47,6 +47,13 @@ from robomp.git_ops import (
     push as git_push,
 )
 from robomp.github_client import GitHubClient, GitHubError
+from robomp.gitlab_client import (
+    GitLabClient,
+    GitLabError,
+    GitLabMergeRequestInfo,
+    GitLabProjectInfo,
+    GitLabUserInfo,
+)
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, verify
 from robomp.sandbox import _safe_directory_env, _slot_subprocess_kwargs
 from robomp.sandbox import workspace_key as compute_workspace_key
@@ -82,6 +89,20 @@ def _gh_error_response(exc: GitHubError) -> JSONResponse:
     )
 
 
+def _gitlab_error_response(exc: GitLabError, *, token: str) -> JSONResponse:
+    """Return an upstream GitLab failure without ever reflecting the PAT."""
+    return JSONResponse(
+        {
+            "error": {
+                "kind": "gitlab",
+                "status": exc.status,
+                "message": exc.message.replace(token, "********"),
+            }
+        },
+        status_code=exc.status,
+    )
+
+
 def _git_error_response(exc: GitCommandError, *, head_drift: bool = False) -> JSONResponse:
     payload: dict[str, Any] = {
         "error": {
@@ -106,6 +127,19 @@ def _require_int(value: Any, field: str) -> int:
     if not isinstance(value, int):
         raise HTTPException(400, f"missing/invalid '{field}'")
     return value
+
+
+def _require_positive_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise HTTPException(400, f"missing/invalid '{field}'")
+    return value
+
+
+def _require_gitlab_project_id(cfg: Settings, value: Any) -> int:
+    project_id = _require_positive_int(value, "project_id")
+    if project_id not in cfg.gitlab_project_ids:
+        raise HTTPException(403, "GitLab project is not allowlisted")
+    return project_id
 
 
 _SAFE_REF_BODY_RE = re.compile(r"[A-Za-z0-9._/-]+")
@@ -182,6 +216,7 @@ def _require_review_comments(value: Any) -> list[dict[str, Any]]:
         comments.append(comment)
     return comments
 
+
 def _pool_dir(cfg: Settings, repo: str) -> Path:
     _validate_repo_name(repo)
     return Path(cfg.workspace_root) / "_pool" / repo.replace("/", "__")
@@ -208,6 +243,12 @@ def _resolve_hmac_key(cfg: Settings) -> bytes:
     return cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
 
 
+def _resolve_gitlab_token(cfg: Settings) -> str:
+    if cfg.gitlab_token is None:
+        raise HTTPException(503, "GitLab proxy is not configured")
+    return cfg.gitlab_token.get_secret_value()
+
+
 _ORIGIN_READ_TIMEOUT_SECONDS = 5.0
 
 
@@ -219,6 +260,8 @@ _GIT_PROBE_SCRUBBED_ENV_KEYS = (
     "GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_GITLAB_TOKEN",
+    "ROBOMP_GITLAB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
@@ -229,6 +272,97 @@ class _RemoteAuth:
     url: str
     token: str | None
     auth_url: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class _GitLabInstance:
+    """Canonical HTTPS GitLab origin plus its optional installation prefix."""
+
+    host: str
+    port: int
+    root: str
+    path_prefix: str
+
+
+def _gitlab_instance(base_url: str) -> _GitLabInstance:
+    """Parse a configured GitLab base URL into a canonical clone origin."""
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(500, "invalid configured GitLab base URL")
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise HTTPException(500, "invalid configured GitLab base URL") from exc
+    prefix = parsed.path.rstrip("/")
+    if prefix.endswith("/api/v4"):
+        prefix = prefix[: -len("/api/v4")]
+    if prefix and not prefix.startswith("/"):
+        raise HTTPException(500, "invalid configured GitLab base URL")
+    host = parsed.hostname.lower()
+    authority = host if port == 443 else f"{host}:{port}"
+    return _GitLabInstance(
+        host=host,
+        port=port,
+        root=f"https://{authority}{prefix}",
+        path_prefix=prefix,
+    )
+
+
+def _gitlab_project_path(project: GitLabProjectInfo) -> str:
+    """Return a safely encoded path from GitLab's trusted project metadata."""
+    parts = project.path_with_namespace.split("/")
+    if not parts or any(not part or part in (".", "..") for part in parts):
+        raise HTTPException(502, "GitLab project returned an invalid path")
+    if any(_FORBIDDEN_URL_BYTES_RE.search(part) for part in parts):
+        raise HTTPException(502, "GitLab project returned an invalid path")
+    return "/".join(quote(part, safe="-._~") for part in parts)
+
+
+def _trusted_gitlab_clone_url(base_url: str, project: GitLabProjectInfo, *, project_id: int) -> str:
+    """Accept only the configured HTTPS origin and the API-returned project path.
+
+    The request body never supplies a Git URL. The configured base URL defines
+    the host and installation prefix; `path_with_namespace` from the selected
+    API project defines the sole permissible repository path.
+    """
+    if project.id != project_id:
+        raise HTTPException(502, "GitLab project metadata ID mismatch")
+    instance = _gitlab_instance(base_url)
+    project_path = _gitlab_project_path(project)
+    expected_path = f"{instance.path_prefix}/{project_path}.git"
+    raw = project.http_url_to_repo.strip()
+    parsed = urlparse(raw)
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise HTTPException(502, "GitLab project returned an invalid clone URL") from exc
+    if (
+        raw != project.http_url_to_repo
+        or (parsed.scheme or "").lower() != "https"
+        or parsed.username
+        or parsed.password
+        or (parsed.hostname or "").lower() != instance.host
+        or port != instance.port
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != expected_path
+    ):
+        raise HTTPException(502, "GitLab project returned an untrusted clone URL")
+    return f"{instance.root}/{project_path}.git"
+
+
+def _gitlab_pool_dir(cfg: Settings, project: GitLabProjectInfo) -> Path:
+    instance = re.sub(r"[^A-Za-z0-9._-]+", "__", cfg.gitlab_instance_id)
+    return Path(cfg.workspace_root) / "_pool" / f"{instance}__{project.id}"
 
 
 def _validate_repo_name(repo: str) -> None:
@@ -359,12 +493,74 @@ def _origin_remote_auth(
         raise
 
 
+def _gitlab_remote_auth_for_url(
+    url: str,
+    *,
+    base_url: str,
+    project: GitLabProjectInfo,
+    project_id: int,
+    token: str,
+) -> _RemoteAuth:
+    """Validate an existing GitLab origin before scoping ephemeral auth to it."""
+    raw = url.strip()
+    if not raw or raw != url:
+        raise HTTPException(400, "GitLab remote URL must not be empty or padded")
+    if _FORBIDDEN_URL_BYTES_RE.search(raw):
+        raise HTTPException(400, "GitLab remote URL contains forbidden control bytes")
+    if raw.startswith("-") or _REMOTE_HELPER_RE.match(raw):
+        raise HTTPException(400, "GitLab remote URL uses a forbidden transport")
+    trusted_url = _trusted_gitlab_clone_url(base_url, project, project_id=project_id)
+    if raw != trusted_url:
+        raise HTTPException(400, "GitLab remote URL does not match trusted project metadata")
+    return _RemoteAuth(url=trusted_url, token=token, auth_url=trusted_url)
+
+
+def _gitlab_origin_remote_auth(
+    repo_dir: Path,
+    *,
+    base_url: str,
+    project: GitLabProjectInfo,
+    project_id: int,
+    token: str,
+    push: bool = False,
+    slot_uid: int | None = None,
+) -> _RemoteAuth:
+    url = _read_single_remote_url(
+        repo_dir,
+        project.path_with_namespace,
+        push=push,
+        slot_uid=slot_uid,
+    )
+    try:
+        return _gitlab_remote_auth_for_url(
+            url,
+            base_url=base_url,
+            project=project,
+            project_id=project_id,
+            token=token,
+        )
+    except HTTPException:
+        log.warning(
+            "gh-proxy: refusing GitLab git operation — origin URL is not permitted",
+            extra={"project_id": project_id, "push": push},
+        )
+        raise
+
+
 def create_proxy_app(settings: Settings) -> FastAPI:
     """Build the gh-proxy FastAPI app bound to `settings`."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.github = GitHubClient(_resolve_token(settings))
+        if settings.github_token is not None:
+            app.state.github = GitHubClient(_resolve_token(settings))
+        if settings.gitlab_proxy_enabled:
+            assert settings.gitlab_base_url is not None
+            app.state.gitlab = GitLabClient(
+                settings.gitlab_base_url,
+                _resolve_gitlab_token(settings),
+                allowed_project_ids=settings.gitlab_project_ids,
+            )
         app.state.settings = settings
         yield
 
@@ -436,6 +632,18 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unauthenticated")
         return body
 
+    def _github_client(request: Request) -> GitHubClient:
+        client = getattr(request.app.state, "github", None)
+        if not isinstance(client, GitHubClient):
+            raise HTTPException(503, "GitHub proxy is not configured")
+        return client
+
+    def _gitlab_client(request: Request) -> GitLabClient:
+        client = getattr(request.app.state, "gitlab", None)
+        if not isinstance(client, GitLabClient):
+            raise HTTPException(503, "GitLab proxy is not configured")
+        return client
+
     # ---- meta ----
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -445,7 +653,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/authenticated_login")
     async def authenticated_login(request: Request) -> dict[str, str]:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             login = await github.get_authenticated_login()
         except GitHubError as exc:
@@ -455,7 +663,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/repo")
     async def get_repo(request: Request, repo: str) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             info = await github.get_repo(repo)
         except GitHubError as exc:
@@ -465,7 +673,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/issue")
     async def get_issue(request: Request, repo: str, number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             info = await github.get_issue(repo, number)
         except GitHubError as exc:
@@ -475,7 +683,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/closing_prs")
     async def list_closing_prs(request: Request, repo: str, number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             prs = await github.list_closing_pull_requests(repo, number)
         except GitHubError as exc:
@@ -485,7 +693,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/pull_request")
     async def get_pull_request(request: Request, repo: str, number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             info = await github.get_pull_request(repo, number)
         except GitHubError as exc:
@@ -495,7 +703,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/pr_files")
     async def list_pr_files(request: Request, repo: str, pr_number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             items = await github.list_pr_files(repo, pr_number)
         except GitHubError as exc:
@@ -505,7 +713,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/issues")
     async def list_issues(request: Request, repo: str, state: str = "open", limit: int = 30) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             items = await github.list_issues(repo, state=state, limit=limit)
         except GitHubError as exc:
@@ -515,7 +723,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/comments")
     async def list_comments(request: Request, repo: str, number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             items = await github.list_comments(repo, number)
         except GitHubError as exc:
@@ -525,7 +733,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/review_comments")
     async def list_review_comments(request: Request, repo: str, pr_number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             items = await github.list_review_comments(repo, pr_number)
         except GitHubError as exc:
@@ -535,7 +743,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/pr_reviews")
     async def list_pr_reviews(request: Request, repo: str, pr_number: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             items = await github.list_pr_reviews(repo, pr_number)
         except GitHubError as exc:
@@ -559,7 +767,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         repo = _require_str(data.get("repo"), "repo")
         number = _require_int(data.get("number"), "number")
         body = _require_str(data.get("body"), "body")
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             info = await github.post_comment(repo, number, body)
         except GitHubError as exc:
@@ -576,7 +784,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         body = _require_str(data.get("body"), "body")
         draft = bool(data.get("draft", False))
         mcm = bool(data.get("maintainer_can_modify", True))
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             pr = await github.open_pull_request(
                 repo=repo,
@@ -598,7 +806,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         pr_number = _require_int(data.get("pr_number"), "pr_number")
         reviewers = _optional_str_list(data.get("reviewers"), "reviewers")
         team_reviewers = _optional_str_list(data.get("team_reviewers"), "team_reviewers")
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             await github.request_reviewers(
                 repo=repo,
@@ -616,7 +824,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         repo = _require_str(data.get("repo"), "repo")
         number = _require_int(data.get("number"), "number")
         labels = _optional_str_list(data.get("labels"), "labels") or []
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             applied = await github.add_issue_labels(repo, number, labels)
         except GitHubError as exc:
@@ -629,7 +837,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         repo = _require_str(data.get("repo"), "repo")
         number = _require_int(data.get("number"), "number")
         label = _require_str(data.get("label"), "label")
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             await github.remove_issue_label(repo, number, label)
         except GitHubError as exc:
@@ -644,7 +852,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         body = _require_str(data.get("body"), "body")
         event = str(data.get("event") or "COMMENT")
         comments = _require_review_comments(data.get("comments"))
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             review = await github.submit_pr_review(
                 repo=repo,
@@ -663,7 +871,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         repo = _require_str(data.get("repo"), "repo")
         number = _require_int(data.get("number"), "number")
         assignees = _optional_str_list(data.get("assignees"), "assignees") or []
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             await github.add_assignees(repo, number, assignees)
         except GitHubError as exc:
@@ -673,7 +881,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     @app.get("/gh/v1/comment_reactions")
     async def list_comment_reactions(request: Request, repo: str, comment_id: int) -> JSONResponse:
         await _authenticate(request)
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             reactions = await github.list_comment_reactions(repo, comment_id)
         except GitHubError as exc:
@@ -687,12 +895,202 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         number = _require_int(data.get("number"), "number")
         reason_raw = data.get("reason")
         reason = reason_raw if isinstance(reason_raw, str) and reason_raw else "completed"
-        github: GitHubClient = request.app.state.github
+        github: GitHubClient = _github_client(request)
         try:
             await github.close_issue(repo, number, reason=reason)
         except GitHubError as exc:
             return _gh_error_response(exc)
         return JSONResponse({"ok": True})
+
+    # ---- GitLab REST ----
+    #
+    # GitLab routes deliberately include a numeric project ID in the path and
+    # validate it before touching the upstream client. There is no generic
+    # passthrough route: each operation is explicitly named and typed.
+    @app.get("/gl/v1/authenticated_user")
+    async def get_gitlab_authenticated_user(request: Request) -> JSONResponse:
+        await _authenticate(request)
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            user: GitLabUserInfo = await gitlab.get_authenticated_user()
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(user))
+
+    @app.get("/gl/v1/projects/{project_id}")
+    async def get_gitlab_project(request: Request, project_id: int) -> JSONResponse:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            project = await gitlab.get_project(project_id)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        trusted_clone = _trusted_gitlab_clone_url(settings.gitlab_base_url or "", project, project_id=project_id)
+        payload = _serialize(project)
+        payload["http_url_to_repo"] = trusted_clone
+        return JSONResponse(payload)
+
+    @app.get("/gl/v1/projects/{project_id}/issues/{iid}")
+    async def get_gitlab_issue(request: Request, project_id: int, iid: int) -> JSONResponse:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            issue = await gitlab.get_issue(project_id, iid)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(issue))
+
+    @app.get("/gl/v1/projects/{project_id}/issues/{iid}/related_merge_requests")
+    async def list_gitlab_issue_related_merge_requests(
+        request: Request,
+        project_id: int,
+        iid: int,
+    ) -> JSONResponse:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            merge_requests = await gitlab.list_issue_related_merge_requests(project_id, iid)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse({"items": [_serialize(merge_request) for merge_request in merge_requests]})
+
+    @app.get("/gl/v1/projects/{project_id}/issues/{iid}/closed_by")
+    async def list_gitlab_issue_closed_by_merge_requests(
+        request: Request,
+        project_id: int,
+        iid: int,
+    ) -> JSONResponse:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            merge_requests = await gitlab.list_issue_closed_by_merge_requests(project_id, iid)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse({"items": [_serialize(merge_request) for merge_request in merge_requests]})
+
+    @app.get("/gl/v1/projects/{project_id}/issues/{iid}/notes")
+    async def list_gitlab_issue_notes(request: Request, project_id: int, iid: int) -> JSONResponse:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            notes = await gitlab.list_issue_notes(project_id, iid)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse({"items": [_serialize(note) for note in notes]})
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/notes")
+    async def post_gitlab_issue_note(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        body = _require_str(data.get("body"), "body")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            note = await gitlab.post_issue_note(project_id, iid, body)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(note))
+
+    @app.put("/gl/v1/projects/{project_id}/issues/{iid}/labels")
+    async def update_gitlab_issue_labels(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        labels = _optional_str_list(data.get("labels"), "labels")
+        if labels is None:
+            raise HTTPException(400, "missing/invalid 'labels'")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            issue = await gitlab.update_issue_labels(project_id, iid, labels)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/labels/add")
+    async def add_gitlab_issue_labels(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        labels = _optional_str_list(data.get("labels"), "labels")
+        if labels is None:
+            raise HTTPException(400, "missing/invalid 'labels'")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            issue = await gitlab.add_issue_labels(project_id, iid, labels)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/labels/remove")
+    async def remove_gitlab_issue_labels(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        labels = _optional_str_list(data.get("labels"), "labels")
+        if labels is None:
+            raise HTTPException(400, "missing/invalid 'labels'")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            issue = await gitlab.remove_issue_labels(project_id, iid, labels)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/close")
+    async def close_gitlab_issue(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        if data:
+            raise HTTPException(400, "GitLab close request body must be empty")
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            issue = await gitlab.close_issue(project_id, iid)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/merge_requests")
+    async def create_gitlab_merge_request(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        source_branch = _require_str(data.get("source_branch"), "source_branch")
+        target_branch = _require_str(data.get("target_branch"), "target_branch")
+        title = _require_str(data.get("title"), "title")
+        description = _require_str(data.get("description"), "description")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            merge_request: GitLabMergeRequestInfo = await gitlab.create_merge_request(
+                project_id,
+                source_branch=source_branch,
+                target_branch=target_branch,
+                title=title,
+                description=description,
+            )
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, token=token)
+        return JSONResponse(_serialize(merge_request))
 
     # ---- git transport ----
     #
@@ -772,6 +1170,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             token=remote.token,
             remote_url=remote.url,
             auth_url=remote.auth_url,
+            timeout=settings.gh_proxy_git_timeout_seconds,
         )
         return JSONResponse({"pool_dir": str(target)})
 
@@ -815,6 +1214,149 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             repo_dir,
             repo,
             _resolve_token(settings),
+            push=True,
+            slot_uid=slot_uid,
+        )
+        try:
+            result = await _run_git_op(
+                git_push,
+                repo_dir,
+                branch=branch,
+                expected_head=expected_head,
+                token=remote.token,
+                remote_url=remote.url,
+                auth_url=remote.auth_url,
+                slot_uid=slot_uid,
+            )
+        except HeadDriftError as exc:
+            return _git_error_response(exc, head_drift=True)
+        except GitCommandError as exc:
+            return _git_error_response(exc)
+        return JSONResponse({"head": result.head, "branch": result.branch})
+
+    # ---- GitLab git transport ----
+    #
+    # The only client-supplied GitLab identifier is the numeric project ID in
+    # the route. Clone URL and default branch are re-resolved from GitLab's
+    # project API response on every operation; they are never accepted from a
+    # proxy request body.
+    async def _gitlab_project_for_git(
+        request: Request,
+        project_id: int,
+    ) -> tuple[GitLabClient, GitLabProjectInfo, str, str]:
+        project_id = _require_gitlab_project_id(settings, project_id)
+        base_url = settings.gitlab_base_url
+        if base_url is None:
+            raise HTTPException(503, "GitLab proxy is not configured")
+        token = _resolve_gitlab_token(settings)
+        gitlab = _gitlab_client(request)
+        try:
+            project = await gitlab.get_project(project_id)
+        except GitLabError as exc:
+            raise HTTPException(exc.status, exc.message.replace(token, "********")) from exc
+        # Validate ID and clone destination before the path is used for either
+        # filesystem selection or token-scoped git authentication.
+        _trusted_gitlab_clone_url(base_url, project, project_id=project_id)
+        return gitlab, project, base_url, token
+
+    @app.post("/gl/v1/projects/{project_id}/git/clone")
+    async def gitlab_clone_endpoint(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        if data:
+            raise HTTPException(400, "GitLab clone request body must be empty")
+        _, project, base_url, token = await _gitlab_project_for_git(request, project_id)
+        trusted_url = _trusted_gitlab_clone_url(base_url, project, project_id=project_id)
+        default_branch = _require_fetch_ref(project.default_branch)
+        target = _gitlab_pool_dir(settings, project)
+        try:
+            await _run_git_op(
+                git_clone,
+                target,
+                clone_url=trusted_url,
+                default_branch=default_branch,
+                token=token,
+                auth_url=trusted_url,
+            )
+        except GitCommandError as exc:
+            return _git_error_response(exc)
+        return JSONResponse({"pool_dir": str(target)})
+
+    @app.post("/gl/v1/projects/{project_id}/git/fetch")
+    async def gitlab_fetch_endpoint(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        if data:
+            raise HTTPException(400, "GitLab fetch request body must be empty")
+        _, project, base_url, token = await _gitlab_project_for_git(request, project_id)
+        target = _gitlab_pool_dir(settings, project)
+        remote = await asyncio.to_thread(
+            _gitlab_origin_remote_auth,
+            target,
+            base_url=base_url,
+            project=project,
+            project_id=project_id,
+            token=token,
+        )
+        try:
+            await _run_git_op(
+                git_fetch_prune,
+                target,
+                token=remote.token,
+                remote_url=remote.url,
+                auth_url=remote.auth_url,
+            )
+        except GitCommandError as exc:
+            return _git_error_response(exc)
+        return JSONResponse({"pool_dir": str(target)})
+
+    @app.post("/gl/v1/projects/{project_id}/git/fetch_ref")
+    async def gitlab_fetch_ref_endpoint(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        ref = _require_fetch_ref(data.get("ref"))
+        _, project, base_url, token = await _gitlab_project_for_git(request, project_id)
+        target = _gitlab_pool_dir(settings, project)
+        remote = await asyncio.to_thread(
+            _gitlab_origin_remote_auth,
+            target,
+            base_url=base_url,
+            project=project,
+            project_id=project_id,
+            token=token,
+        )
+        # `git_fetch_ref` intentionally degrades a fetch failure into the
+        # following checkout's more actionable error, matching GitHub mode.
+        await _run_git_op(
+            git_fetch_ref,
+            target,
+            ref,
+            token=remote.token,
+            remote_url=remote.url,
+            auth_url=remote.auth_url,
+            timeout=settings.gh_proxy_git_timeout_seconds,
+        )
+        return JSONResponse({"pool_dir": str(target)})
+
+    @app.post("/gl/v1/projects/{project_id}/git/push")
+    async def gitlab_push_endpoint(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        workspace_key = _require_str(data.get("workspace_key"), "workspace_key")
+        branch = _require_str(data.get("branch"), "branch")
+        expected_head = _require_str(data.get("expected_head"), "expected_head")
+        slot_uid = _optional_slot_uid(data.get("slot_uid"))
+        _, project, base_url, token = await _gitlab_project_for_git(request, project_id)
+        instance = re.sub(r"[^A-Za-z0-9._-]+", "__", settings.gitlab_instance_id)
+        expected_prefix = f"{instance}__{project_id}__"
+        if not workspace_key.startswith(expected_prefix):
+            raise HTTPException(400, "workspace_key does not match GitLab project")
+        repo_dir = _workspace_repo_dir(settings, workspace_key)
+        if not repo_dir.is_dir():
+            raise HTTPException(404, f"workspace not found: {workspace_key}")
+        remote = await asyncio.to_thread(
+            _gitlab_origin_remote_auth,
+            repo_dir,
+            base_url=base_url,
+            project=project,
+            project_id=project_id,
+            token=token,
             push=True,
             slot_uid=slot_uid,
         )

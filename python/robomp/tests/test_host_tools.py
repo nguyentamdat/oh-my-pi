@@ -112,6 +112,8 @@ def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
     monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret-webhook")
     monkeypatch.setenv("ROBOMP_GH_PROXY_HMAC_KEY", "secret-proxy")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "secret-gitlab-webhook")
+    monkeypatch.setenv("ROBOMP_GITLAB_TOKEN", "secret-gitlab-token")
     monkeypatch.setenv("BUN_INSTALL_CACHE_DIR", "/data/cache/bun-cache")
 
     bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
@@ -123,6 +125,8 @@ def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
     assert env["GITHUB_TOKEN"] == ""
     assert env["GITHUB_WEBHOOK_SECRET"] == ""
     assert env["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
+    assert env["ROBOMP_GITLAB_WEBHOOK_SECRET"] == ""
+    assert env["ROBOMP_GITLAB_TOKEN"] == ""
     assert env["BUN_INSTALL_CACHE_DIR"] == str(bindings.workspace.root / ".omp-xdg" / "cache" / "bun-install")
     assert env["XDG_CACHE_HOME"] == str(bindings.workspace.root / ".omp-xdg" / "cache")
     assert env["TMPDIR"] == str(bindings.workspace.root / ".omp-tmp")
@@ -323,7 +327,7 @@ def test_guarded_push_branch_rev_parse_runs_via_repo_command_and_passes_slot_uid
     monkeypatch.setattr(host_tools, "_run_repo_command", fake_run_repo_command)
     monkeypatch.setattr(host_tools, "_share_git_metadata_with_slots", lambda _repo_dir, _slot_uid: None)
     try:
-        head = host_tools._guarded_push_branch(bindings, {}, "gh_push_branch", bindings.workspace.branch)
+        head = host_tools._guarded_push_branch(bindings, {}, "forge_push_branch", bindings.workspace.branch)
     finally:
         _stop_loop(loop, thread)
 
@@ -341,7 +345,7 @@ def test_guarded_push_branch_rev_parse_runs_via_repo_command_and_passes_slot_uid
     ]
 
 
-def test_gh_post_comment_happy_path(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_happy_path(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -353,7 +357,7 @@ def test_gh_post_comment_happy_path(db: Database, tmp_path: Path) -> None:
     transport = httpx.MockTransport(handler)
     bindings, loop, t = _bindings(db, tmp_path, transport)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         result = tool.execute({"body": "hi"}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -364,17 +368,17 @@ def test_gh_post_comment_happy_path(db: Database, tmp_path: Path) -> None:
     assert captured["auth"] == "Bearer token"
 
 
-def test_gh_post_comment_validates_body(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_validates_body(db: Database, tmp_path: Path) -> None:
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)))
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         with pytest.raises(RpcCommandError):
             tool.execute({"body": ""}, _ctx())
     finally:
         _stop_loop(loop, t)
 
 
-def test_gh_post_comment_defaults_to_inbound_pr_thread(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_defaults_to_inbound_pr_thread(db: Database, tmp_path: Path) -> None:
     """PR conversation/review tasks set inbound_thread_number to the PR; the
     agent's reply must land on that PR by default, not the originating issue."""
     captured: dict[str, Any] = {}
@@ -399,7 +403,7 @@ def test_gh_post_comment_defaults_to_inbound_pr_thread(db: Database, tmp_path: P
         inbound_thread_number=99,  # PR #99 that fixes issue #42
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "hi"}, _ctx())
     finally:
         _stop_loop(loop, thread)
@@ -407,7 +411,7 @@ def test_gh_post_comment_defaults_to_inbound_pr_thread(db: Database, tmp_path: P
     assert captured["url"].endswith("/repos/octo/widget/issues/99/comments"), captured["url"]
 
 
-def test_gh_post_comment_explicit_number_overrides_inbound(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_explicit_number_overrides_inbound(db: Database, tmp_path: Path) -> None:
     """An explicit `number` arg still wins over the inbound default."""
     captured: dict[str, Any] = {}
 
@@ -431,7 +435,7 @@ def test_gh_post_comment_explicit_number_overrides_inbound(db: Database, tmp_pat
         inbound_thread_number=99,
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "hi", "number": 42}, _ctx())
     finally:
         _stop_loop(loop, thread)
@@ -439,11 +443,11 @@ def test_gh_post_comment_explicit_number_overrides_inbound(db: Database, tmp_pat
     assert captured["url"].endswith("/repos/octo/widget/issues/42/comments"), captured["url"]
 
 
-def test_gh_post_comment_propagates_github_error(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_propagates_github_error(db: Database, tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda r: httpx.Response(422, json={"message": "Validation failed"}))
     bindings, loop, t = _bindings(db, tmp_path, transport)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"body": "hi"}, _ctx())
         assert "422" in str(exc.value)
@@ -451,12 +455,12 @@ def test_gh_post_comment_propagates_github_error(db: Database, tmp_path: Path) -
         _stop_loop(loop, t)
 
 
-def test_gh_open_pr_requires_template_sections(db: Database, tmp_path: Path) -> None:
+def test_forge_open_change_requires_template_sections(db: Database, tmp_path: Path) -> None:
     transport = httpx.MockTransport(lambda r: httpx.Response(500))
     bindings, loop, t = _bindings(db, tmp_path, transport)
     db.set_issue_classification(bindings.issue_key, "bug")
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "t", "body": "no sections"}, _ctx())
         assert "Repro" in str(exc.value)
@@ -837,7 +841,7 @@ def test_classify_issue_question_skips_repro_path(db: Database, tmp_path: Path) 
     finally:
         _stop_loop(loop, t)
     assert "question" in result
-    assert "no PR" in result
+    assert "no branch or PR/MR" in result
     row = db.get_issue(bindings.issue_key)
     assert row is not None and row.classification == "question"
 
@@ -1168,8 +1172,8 @@ def test_review_mode_rejects_push_and_open_pr_before_repo_commands(db: Database,
     try:
         original = host_tools._run_repo_command
         host_tools._run_repo_command = record_repo_command  # type: ignore[assignment]
-        push = next(x for x in build(bindings) if x.name == "gh_push_branch")
-        open_pr = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        push = next(x for x in build(bindings) if x.name == "forge_push_branch")
+        open_pr = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError):
             push.execute({}, _ctx())
         with pytest.raises(RpcCommandError):
@@ -1196,8 +1200,8 @@ def test_impl_gate_rejects_unauthorized_non_auto_classification_before_repo_comm
     db.set_issue_classification(bindings.issue_key, classification)
     monkeypatch.setattr(host_tools, "_run_repo_command", record_repo_command)
     try:
-        push = next(x for x in build(bindings) if x.name == "gh_push_branch")
-        open_pr = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        push = next(x for x in build(bindings) if x.name == "forge_push_branch")
+        open_pr = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError) as push_exc:
             push.execute({}, _ctx())
         with pytest.raises(RpcCommandError) as pr_exc:
@@ -1208,12 +1212,12 @@ def test_impl_gate_rejects_unauthorized_non_auto_classification_before_repo_comm
     for msg in (str(push_exc.value), str(pr_exc.value)):
         assert f"classified `{classification}`" in msg
         assert "OWNER or allowlisted maintainer" in msg
-        assert "gh_post_comment" in msg
+        assert "forge_post_comment" in msg
     assert calls == []
     rows = db._conn.execute(
-        "SELECT tool, error FROM tool_calls WHERE tool IN ('gh_push_branch', 'gh_open_pr') ORDER BY id"
+        "SELECT tool, error FROM tool_calls WHERE tool IN ('forge_push_branch', 'forge_open_change') ORDER BY id"
     ).fetchall()
-    assert [row["tool"] for row in rows] == ["gh_push_branch", "gh_open_pr"]
+    assert [row["tool"] for row in rows] == ["forge_push_branch", "forge_open_change"]
     assert all(f"classified `{classification}`" in row["error"] for row in rows)
 
 
@@ -1227,7 +1231,7 @@ def test_impl_gate_allows_authorized_non_auto_classification_to_reach_pr_validat
     db.set_issue_classification(bindings.issue_key, classification)
     bindings = replace(bindings, impl_authorized=True)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": ""}, _ctx())
     finally:
@@ -1249,15 +1253,15 @@ def test_impl_gate_allows_authorized_non_auto_classification_push_to_reach_repo_
     def record_repo_command(_bindings: ToolBindings, cmd: list[str] | tuple[str, ...], *, timeout: float | None = None):
         del timeout
         calls.append(cmd)
-        raise RuntimeError("authorized non-auto issue reached gh_push_branch repo command")
+        raise RuntimeError("authorized non-auto issue reached forge_push_branch repo command")
 
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, classification)
     bindings = replace(bindings, impl_authorized=True)
     monkeypatch.setattr(host_tools, "_run_repo_command", record_repo_command)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
-        with pytest.raises(RuntimeError, match="authorized non-auto issue reached gh_push_branch repo command"):
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
+        with pytest.raises(RuntimeError, match="authorized non-auto issue reached forge_push_branch repo command"):
             tool.execute({}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -1273,7 +1277,7 @@ def test_impl_gate_allows_later_authorized_event_to_reach_repo_commands(
     def record_repo_command(_bindings: ToolBindings, cmd: list[str] | tuple[str, ...], *, timeout: float | None = None):
         del timeout
         calls.append(cmd)
-        raise RuntimeError("later authorized event reached gh_push_branch repo command")
+        raise RuntimeError("later authorized event reached forge_push_branch repo command")
 
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, "enhancement")
@@ -1293,8 +1297,8 @@ def test_impl_gate_allows_later_authorized_event_to_reach_repo_commands(
     )
     monkeypatch.setattr(host_tools, "_run_repo_command", record_repo_command)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
-        with pytest.raises(RuntimeError, match="later authorized event reached gh_push_branch repo command"):
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
+        with pytest.raises(RuntimeError, match="later authorized event reached forge_push_branch repo command"):
             tool.execute({}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -1302,7 +1306,9 @@ def test_impl_gate_allows_later_authorized_event_to_reach_repo_commands(
     assert calls
 
 
-def test_impl_gate_ignores_skipped_authorized_event(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_impl_gate_ignores_skipped_authorized_event(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls: list[list[str] | tuple[str, ...]] = []
 
     def record_repo_command(_bindings: ToolBindings, cmd: list[str] | tuple[str, ...], *, timeout: float | None = None):
@@ -1329,7 +1335,7 @@ def test_impl_gate_ignores_skipped_authorized_event(db: Database, tmp_path: Path
     )
     monkeypatch.setattr(host_tools, "_run_repo_command", record_repo_command)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({}, _ctx())
     finally:
@@ -1343,7 +1349,7 @@ def test_impl_gate_allows_bug_without_directive_to_reach_pr_validation(db: Datab
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, "bug")
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": ""}, _ctx())
     finally:
@@ -1359,7 +1365,7 @@ def test_impl_gate_allows_existing_proposal_pr_to_reach_pr_validation(db: Databa
     db.set_issue_classification(bindings.issue_key, "proposal")
     db.set_issue_pr(bindings.issue_key, 7)
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": ""}, _ctx())
     finally:
@@ -1621,7 +1627,7 @@ def test_set_issue_labels_rejects_empty(db: Database, tmp_path: Path) -> None:
         _stop_loop(loop, t)
 
 
-def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> None:
+def test_forge_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> None:
     """Pre-push gate refuses to push commits authored by anyone other than the configured identity."""
     import os
     import subprocess
@@ -1708,7 +1714,7 @@ def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> 
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({}, _ctx())
         msg = str(exc.value)
@@ -1727,8 +1733,8 @@ def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> 
         _stop_loop(loop, thread)
 
 
-def test_gh_open_pr_rejects_wrong_identity_before_push_or_pr(db: Database, tmp_path: Path) -> None:
-    """gh_open_pr uses the guarded push path before creating the pull request."""
+def test_forge_open_change_rejects_wrong_identity_before_push_or_pr(db: Database, tmp_path: Path) -> None:
+    """forge_open_change uses the guarded push path before creating the pull request."""
     import os
     import subprocess
 
@@ -1827,7 +1833,7 @@ def test_gh_open_pr_rejects_wrong_identity_before_push_or_pr(db: Database, tmp_p
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nrepro\n\n## Cause\ncause\n\n## Fix\nfix\n\n## Verification\nran tests\n\nFixes #42\n"
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": body}, _ctx())
@@ -1844,7 +1850,7 @@ def test_gh_open_pr_rejects_wrong_identity_before_push_or_pr(db: Database, tmp_p
         _stop_loop(loop, thread)
 
 
-def test_gh_push_branch_rejects_invalid_identity_scan_range(db: Database, tmp_path: Path) -> None:
+def test_forge_push_branch_rejects_invalid_identity_scan_range(db: Database, tmp_path: Path) -> None:
     """A failing git-log author scan is a push rejection, not an empty successful scan."""
     import os
     import subprocess
@@ -1948,7 +1954,7 @@ def test_gh_push_branch_rejects_invalid_identity_scan_range(db: Database, tmp_pa
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({}, _ctx())
         msg = str(exc.value)
@@ -1962,7 +1968,7 @@ def test_gh_push_branch_rejects_invalid_identity_scan_range(db: Database, tmp_pa
         )
         assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
         row = db._conn.execute(
-            "SELECT error FROM tool_calls WHERE tool='gh_push_branch' ORDER BY id DESC LIMIT 1"
+            "SELECT error FROM tool_calls WHERE tool='forge_push_branch' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         assert row is not None and "could not inspect commit authors" in row["error"]
         assert "origin/main..HEAD" in row["error"]
@@ -1970,12 +1976,12 @@ def test_gh_push_branch_rejects_invalid_identity_scan_range(db: Database, tmp_pa
         _stop_loop(loop, thread)
 
 
-def test_gh_open_pr_requires_closes_keyword(db: Database, tmp_path: Path) -> None:
-    """gh_open_pr refuses if the body has the four sections but no Fixes/Closes/Resolves keyword."""
+def test_forge_open_change_requires_closes_keyword(db: Database, tmp_path: Path) -> None:
+    """forge_open_change refuses if the body has the four sections but no Fixes/Closes/Resolves keyword."""
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, "bug")
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nrepro\n\n## Cause\ncause\n\n## Fix\nfix\n\n## Verification\nran tests\n"
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": body}, _ctx())
@@ -1984,10 +1990,10 @@ def test_gh_open_pr_requires_closes_keyword(db: Database, tmp_path: Path) -> Non
         _stop_loop(loop, t)
 
 
-def test_gh_open_pr_refuses_failed_bun_check_before_push_or_pr(
+def test_forge_open_change_refuses_failed_bun_check_before_push_or_pr(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """gh_open_pr sends a failing pre-PR check back to the agent without creating a PR."""
+    """forge_open_change sends a failing pre-PR check back to the agent without creating a PR."""
     import os
 
     opened_pr = False
@@ -2025,7 +2031,7 @@ def test_gh_open_pr_refuses_failed_bun_check_before_push_or_pr(
     )
 
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nrepro\n\n## Cause\ncause\n\n## Fix\nfix\n\n## Verification\nran tests\n\nFixes #42\n"
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"title": "fix: x", "body": body}, _ctx())
@@ -2037,12 +2043,14 @@ def test_gh_open_pr_refuses_failed_bun_check_before_push_or_pr(
     assert "`bun check` failed before open PR" in msg
     assert "TypeError: property missing" in msg
     assert not opened_pr
-    row = db._conn.execute("SELECT error FROM tool_calls WHERE tool='gh_open_pr' ORDER BY id DESC LIMIT 1").fetchone()
+    row = db._conn.execute(
+        "SELECT error FROM tool_calls WHERE tool='forge_open_change' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
     assert row is not None
     assert "TypeError: property missing" in row["error"]
 
 
-def test_gh_push_branch_rejects_dirty_worktree(db: Database, tmp_path: Path) -> None:
+def test_forge_push_branch_rejects_dirty_worktree(db: Database, tmp_path: Path) -> None:
     """Pre-push gate refuses if the working tree has uncommitted changes."""
     import os
     import subprocess
@@ -2147,7 +2155,7 @@ def test_gh_push_branch_rejects_dirty_worktree(db: Database, tmp_path: Path) -> 
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({}, _ctx())
         assert "working tree is dirty" in str(exc.value)
@@ -2163,11 +2171,11 @@ def test_gh_push_branch_rejects_dirty_worktree(db: Database, tmp_path: Path) -> 
         _stop_loop(loop, thread)
 
 
-def test_gh_push_branch_runs_fix_and_check_before_pushing(
+def test_forge_push_branch_runs_fix_and_check_before_pushing(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """gh_push_branch must run `bun run fix` then `bun check` (when defined)
-    before the push reaches the remote. Same gate as `gh_open_pr` so a
+    """forge_push_branch must run `bun run fix` then `bun check` (when defined)
+    before the push reaches the remote. Same gate as `forge_open_change` so a
     follow-up commit can't break CI."""
     import os
     import subprocess
@@ -2295,7 +2303,7 @@ def test_gh_push_branch_runs_fix_and_check_before_pushing(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         result = tool.execute({}, _ctx())
     finally:
         _stop_loop(loop, thread)
@@ -2334,7 +2342,7 @@ def test_gh_push_branch_runs_fix_and_check_before_pushing(
     assert f"refs/heads/{ws.branch}" in refs.stdout.splitlines()
 
 
-def test_gh_push_branch_force_with_lease_recovers_after_amend(db: Database, tmp_path: Path) -> None:
+def test_forge_push_branch_force_with_lease_recovers_after_amend(db: Database, tmp_path: Path) -> None:
     """A divergent local history (amended commit) must push successfully.
 
     Plain `git push` rejects this as non-fast-forward, leaving the agent stuck.
@@ -2440,7 +2448,7 @@ def test_gh_push_branch_force_with_lease_recovers_after_amend(db: Database, tmp_
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         tool.execute({}, _ctx())
 
         # Confirm origin received the original commit.
@@ -2495,7 +2503,7 @@ def test_gh_push_branch_force_with_lease_recovers_after_amend(db: Database, tmp_
     assert final_remote == new_local, (final_remote, new_local)
 
 
-def test_gh_push_branch_aborts_on_failed_bun_check(
+def test_forge_push_branch_aborts_on_failed_bun_check(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failing `bun check` aborts the push and leaves the remote untouched."""
@@ -2619,7 +2627,7 @@ def test_gh_push_branch_aborts_on_failed_bun_check(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({}, _ctx())
     finally:
@@ -2637,15 +2645,15 @@ def test_gh_push_branch_aborts_on_failed_bun_check(
         check=True,
     )
     assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
-    # Audit row attributes the failure to gh_push_branch, not gh_open_pr.
+    # Audit row attributes the failure to forge_push_branch, not forge_open_change.
     row = db._conn.execute(
-        "SELECT tool, error FROM tool_calls WHERE tool='gh_push_branch' ORDER BY id DESC LIMIT 1"
+        "SELECT tool, error FROM tool_calls WHERE tool='forge_push_branch' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None
     assert "TypeError: property missing" in row["error"]
 
 
-def test_gh_push_branch_skip_checks_bypasses_failing_bun_check(
+def test_forge_push_branch_skip_checks_bypasses_failing_bun_check(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`skip_checks=true` bypasses a failing `bun check` and pushes anyway.
@@ -2775,7 +2783,7 @@ def test_gh_push_branch_skip_checks_bypasses_failing_bun_check(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         result = tool.execute({"skip_checks": True}, _ctx())
     finally:
         _stop_loop(loop, thread)
@@ -2794,14 +2802,14 @@ def test_gh_push_branch_skip_checks_bypasses_failing_bun_check(
     assert any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
     # Audit row records the skip.
     rows = db._conn.execute(
-        "SELECT tool, result_json FROM tool_calls WHERE tool='gh_push_branch' ORDER BY id"
+        "SELECT tool, result_json FROM tool_calls WHERE tool='forge_push_branch' ORDER BY id"
     ).fetchall()
     skipped = [json.loads(r["result_json"] or "{}") for r in rows]
     assert any(s.get("skipped") == "bun_run_fix" for s in skipped)
     assert any(s.get("skipped") == "bun_check" for s in skipped)
 
 
-def test_gh_push_branch_skip_checks_still_refuses_dirty_worktree(
+def test_forge_push_branch_skip_checks_still_refuses_dirty_worktree(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`skip_checks=true` MUST still refuse when there are uncommitted changes —
@@ -2913,7 +2921,7 @@ def test_gh_push_branch_skip_checks_still_refuses_dirty_worktree(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"skip_checks": True}, _ctx())
     finally:
@@ -2931,10 +2939,10 @@ def test_gh_push_branch_skip_checks_still_refuses_dirty_worktree(
     assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
 
 
-def test_gh_open_pr_runs_fix_then_check_and_amends_formatter_diff(
+def test_forge_open_change_runs_fix_then_check_and_amends_formatter_diff(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """gh_open_pr runs `bun run fix`, amends any diff into HEAD, then runs `bun check`."""
+    """forge_open_change runs `bun run fix`, amends any diff into HEAD, then runs `bun check`."""
     import os
     import subprocess
 
@@ -3080,7 +3088,7 @@ def test_gh_open_pr_runs_fix_then_check_and_amends_formatter_diff(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nrepro\n\n## Cause\ncause\n\n## Fix\nfix\n\n## Verification\nran tests\n\nFixes #42\n"
         result = tool.execute({"title": "fix: x", "body": body}, _ctx())
     finally:
@@ -3127,10 +3135,10 @@ def test_gh_open_pr_runs_fix_then_check_and_amends_formatter_diff(
     assert f"refs/heads/{ws.branch}" in refs.stdout.splitlines()
 
 
-def test_gh_open_pr_refuses_dirty_worktree_before_fix(
+def test_forge_open_change_refuses_dirty_worktree_before_fix(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pre-existing uncommitted edit MUST cause gh_open_pr (and gh_push_branch)
+    """A pre-existing uncommitted edit MUST cause forge_open_change (and forge_push_branch)
     to refuse BEFORE `bun run fix` runs — otherwise `git add -A` after fix
     would silently amend the unrelated edit into the agent's HEAD commit
     and ship it in the PR."""
@@ -3262,12 +3270,12 @@ def test_gh_open_pr_refuses_dirty_worktree_before_fix(
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        push_tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        push_tool = next(x for x in build(bindings) if x.name == "forge_push_branch")
         with pytest.raises(RpcCommandError) as exc:
             push_tool.execute({}, _ctx())
         assert "dirty worktree" in str(exc.value).lower()
 
-        pr_tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        pr_tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nr\n\n## Cause\nc\n\n## Fix\nf\n\n## Verification\nv\n\nFixes #42\n"
         with pytest.raises(RpcCommandError) as exc2:
             pr_tool.execute({"title": "fix: x", "body": body}, _ctx())
@@ -3301,7 +3309,9 @@ def test_gh_open_pr_refuses_dirty_worktree_before_fix(
     assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines())
 
 
-def test_gh_open_pr_skips_fix_when_no_script(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forge_open_change_skips_fix_when_no_script(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No `scripts.fix` entry → fix stage is a no-op even if `scripts.check` exists."""
     import os
     import subprocess
@@ -3438,7 +3448,7 @@ def test_gh_open_pr_skips_fix_when_no_script(db: Database, tmp_path: Path, monke
             session_dir=str(ws.session_dir),
         )
         db.set_issue_classification(bindings.issue_key, "bug")
-        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        tool = next(x for x in build(bindings) if x.name == "forge_open_change")
         body = "## Repro\nrepro\n\n## Cause\ncause\n\n## Fix\nfix\n\n## Verification\nran tests\n\nFixes #42\n"
         result = tool.execute({"title": "fix: x", "body": body}, _ctx())
     finally:
@@ -3449,7 +3459,7 @@ def test_gh_open_pr_skips_fix_when_no_script(db: Database, tmp_path: Path, monke
     assert "opened #7" in result
 
 
-# -------- gh_post_comment + question auto-close ---------------------------
+# -------- forge_post_comment + question auto-close ---------------------------
 
 
 def _stub_settings(*, enabled: bool = True, hours: float = 4.0):
@@ -3488,7 +3498,7 @@ def _question_handler(captured: dict[str, Any]):
     return handler
 
 
-def test_gh_post_comment_appends_suffix_and_schedules_for_question(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_appends_suffix_and_schedules_for_question(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
     transport = httpx.MockTransport(_question_handler(captured))
     bindings, loop, t = _bindings(db, tmp_path, transport)
@@ -3506,7 +3516,7 @@ def test_gh_post_comment_appends_suffix_and_schedules_for_question(db: Database,
         settings=_stub_settings(),
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "Here's the answer"}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -3524,7 +3534,7 @@ def test_gh_post_comment_appends_suffix_and_schedules_for_question(db: Database,
     assert row.issue_author == "alice"
 
 
-def test_gh_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
     transport = httpx.MockTransport(_question_handler(captured))
     bindings, loop, t = _bindings(db, tmp_path, transport)
@@ -3542,7 +3552,7 @@ def test_gh_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: P
         settings=_stub_settings(),
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "Here's the diagnosis"}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -3551,7 +3561,7 @@ def test_gh_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: P
     assert db.get_pending_closure(bindings.issue_key) is None
 
 
-def test_gh_post_comment_skips_suffix_when_target_differs_from_origin(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_skips_suffix_when_target_differs_from_origin(db: Database, tmp_path: Path) -> None:
     """Posting to a different `number` (e.g. cross-issue reply) must not schedule."""
     captured: dict[str, Any] = {}
     transport = httpx.MockTransport(_question_handler(captured))
@@ -3570,7 +3580,7 @@ def test_gh_post_comment_skips_suffix_when_target_differs_from_origin(db: Databa
         settings=_stub_settings(),
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "see other issue", "number": 99}, _ctx())
     finally:
         _stop_loop(loop, t)
@@ -3579,7 +3589,7 @@ def test_gh_post_comment_skips_suffix_when_target_differs_from_origin(db: Databa
     assert db.get_pending_closure(bindings.issue_key) is None
 
 
-def test_gh_post_comment_skips_suffix_when_feature_disabled(db: Database, tmp_path: Path) -> None:
+def test_forge_post_comment_skips_suffix_when_feature_disabled(db: Database, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
     transport = httpx.MockTransport(_question_handler(captured))
     bindings, loop, t = _bindings(db, tmp_path, transport)
@@ -3597,10 +3607,41 @@ def test_gh_post_comment_skips_suffix_when_feature_disabled(db: Database, tmp_pa
         settings=_stub_settings(enabled=False),
     )
     try:
-        tool = next(x for x in build(bindings) if x.name == "gh_post_comment")
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
         tool.execute({"body": "Here's the answer"}, _ctx())
     finally:
         _stop_loop(loop, t)
+
+    assert captured["body"] == {"body": "Here's the answer"}
+    assert db.get_pending_closure(bindings.issue_key) is None
+
+
+def test_forge_post_comment_skips_autoclose_when_backend_lacks_reactions(
+    db: Database,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    original, loop, thread = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(original.issue_key, "question")
+    bindings = ToolBindings(
+        db=original.db,
+        github=original.github,
+        git_transport=original.git_transport,
+        repo=original.repo,
+        issue=original.issue,
+        workspace=original.workspace,
+        loop=original.loop,
+        author_name=original.author_name,
+        author_email=original.author_email,
+        settings=_stub_settings(),
+        supports_question_autoclose=False,
+    )
+    try:
+        tool = next(item for item in build(bindings) if item.name == "forge_post_comment")
+        tool.execute({"body": "Here's the answer"}, _ctx())
+    finally:
+        _stop_loop(loop, thread)
 
     assert captured["body"] == {"body": "Here's the answer"}
     assert db.get_pending_closure(bindings.issue_key) is None

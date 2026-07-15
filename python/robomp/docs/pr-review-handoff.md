@@ -46,9 +46,9 @@ Existing task kinds and their analogues for us:
 
 | Task | Trigger (`route`) | Workspace | Terminal action | Notes |
 |---|---|---|---|---|
-| `triage_issue` | `issues.opened` | fresh `farm/<hex>/<slug>` worktree | `gh_open_pr` / `mark_unable_to_reproduce` / `abort_task` | **The fresh-entry template** for `review_pr`. |
-| `handle_comment` | `issue_comment.created` on an issue | resume existing | one `gh_post_comment` | |
-| `handle_pr_conversation` | `issue_comment.created` on a PR | resume bot-PR branch | `gh_post_comment` / push | bot-owned PRs only. |
+| `triage_issue` | `issues.opened` | fresh `farm/<hex>/<slug>` worktree | `forge_open_change` / `mark_unable_to_reproduce` / `abort_task` | **The fresh-entry template** for `review_pr`. |
+| `handle_comment` | `issue_comment.created` on an issue | resume existing | one `forge_post_comment` | |
+| `handle_pr_conversation` | `issue_comment.created` on a PR | resume bot-PR branch | `forge_post_comment` / push | bot-owned PRs only. |
 | `handle_review` | `pull_request_review_comment.created` on a **bot-authored** PR | resume via `existing_branch=pr.head_ref` | reply / push | **The PR-context template** — shows `ensure_workspace(existing_branch=…)` and `inbound_is_pr`. |
 | `cleanup_workspace` | `issues.closed` / bot `pull_request.merged` | removes worktree | — | |
 
@@ -240,7 +240,7 @@ Add a `review_mode: bool = False` field to `ToolBindings`; set it from `run_task
 `classify_issue` gates on `inbound_is_pr`):
 
 - New review tools require `review_mode` → reject otherwise.
-- `gh_push_branch` / `gh_open_pr` **refuse** when `review_mode` (read-only review; never push to
+- `forge_push_branch` / `forge_open_change` **refuse** when `review_mode` (read-only review; never push to
   a contributor's branch).
 
 Four new tools, registered unconditionally in `build()`:
@@ -351,7 +351,7 @@ Mirror existing test style; assert observable contracts, never internals.
 - **Staging + submit**: `pr_review_comment` writes rows (assert via DB); `submit_pr_review` posts
   one review with all staged comments + `event="COMMENT"` (assert the mocked POST body) and clears
   the buffer; second submit with empty buffer posts summary-only / no-ops.
-- **review_mode gating**: `gh_push_branch`/`gh_open_pr` refuse under `review_mode`; review tools
+- **review_mode gating**: `forge_push_branch`/`forge_open_change` refuse under `review_mode`; review tools
   refuse outside it.
 - **Sandbox** (`test_sandbox.py`, real local bare repo as upstream): `pr_head` checkout yields a
   detached worktree at the PR head commit; no push remote configured.

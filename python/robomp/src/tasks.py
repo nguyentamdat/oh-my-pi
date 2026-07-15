@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, IssueRow, IssueState, issue_key
+from robomp.forge import ForgeEvent
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import (
     CommentInfo,
@@ -72,6 +73,38 @@ def _comment_from_payload(payload: Mapping[str, Any]) -> CommentInfo:
         body=str(c.get("body") or ""),
         created_at=str(c.get("created_at") or ""),
     )
+
+
+def _comment_from_event(event: ForgeEvent) -> CommentInfo:
+    comment = event.comment
+    if comment is None:
+        return CommentInfo(id=0, author=event.actor.login, body="", created_at="")
+    try:
+        comment_id = int(comment.remote_id)
+    except ValueError:
+        comment_id = 0
+    return CommentInfo(
+        id=comment_id,
+        author=comment.author,
+        body=comment.body,
+        created_at=comment.created_at,
+    )
+
+
+def _workspace_identity(event: ForgeEvent | None) -> dict[str, object]:
+    if event is None:
+        return {}
+    return {
+        "instance_id": event.item.repository.instance_id,
+        "repository_id": event.item.repository.remote_id,
+        "item_kind": event.item.kind,
+    }
+
+
+def _forge_actor(settings: Settings, event: ForgeEvent | None) -> tuple[str, str]:
+    if event is not None and event.item.repository.instance_id == settings.gitlab_instance_id:
+        return settings.git_author_name or settings.gitlab_bot_login, settings.gitlab_bot_login
+    return settings.resolved_author_name, settings.bot_login
 
 
 def _directive_from_payload(payload: Mapping[str, Any]) -> DirectiveInfo | None:
@@ -205,8 +238,16 @@ async def _attach_thread(
 
 async def _resolve_repo_and_issue(
     github: GitHubBackend,
-    payload: Mapping[str, Any],
+    payload: Mapping[str, Any] | None,
+    forge_event: ForgeEvent | None = None,
 ) -> tuple[RepoInfo, IssueInfo]:
+    if forge_event is not None:
+        repository = forge_event.item.repository.full_name
+        repo = await github.get_repo(repository)
+        issue = await github.get_issue(repository, forge_event.item.number)
+        return repo, issue
+    if payload is None:
+        raise ValueError("payload is required without a canonical forge event")
     repo, issue = parse_issue_payload(payload)
     if not issue.body:
         # Webhook payloads sometimes omit body; refetch to be safe.
@@ -272,16 +313,23 @@ async def triage_issue(
     github: GitHubBackend,
     sandbox: SandboxManager,
     git_transport: GitTransport,
-    payload: Mapping[str, Any],
     delivery_id: str,
+    payload: Mapping[str, Any] | None = None,
+    forge_event: ForgeEvent | None = None,
     attempts: int = 0,
     slot_uid: int | None = None,
 ) -> None:
-    repo, issue = await _resolve_repo_and_issue(github, payload)
+    repo, issue = (
+        await _resolve_repo_and_issue(github, payload, forge_event)
+        if forge_event is not None
+        else await _resolve_repo_and_issue(github, payload)
+    )
+    workspace_identity = _workspace_identity(forge_event)
+    author_name, bot_login = _forge_actor(settings, forge_event)
     if issue.is_pull_request:
         log.info("skip: triage on PR-like issue", extra={"repo": repo.full_name, "n": issue.number})
         return
-    key = issue_key(repo.full_name, issue.number)
+    key = forge_event.item.key if forge_event is not None else issue_key(repo.full_name, issue.number)
     if db.get_issue(key) is None:
         # First-time triage: bail if a PR (human or another bot) already
         # claims to close this issue via Closes/Fixes/Resolves syntax or
@@ -291,8 +339,8 @@ async def triage_issue(
         try:
             closing_prs = await github.list_closing_pull_requests(repo.full_name, issue.number)
         except GitHubError as exc:
-            # Fail-open: a transient timeline fetch failure shouldn't
-            # block legitimate triage. Worst case we do redundant work.
+            if getattr(github, "strict_closing_lookup", False):
+                raise
             log.warning(
                 "closing-PR check failed; proceeding with triage",
                 extra={"key": key, "err": str(exc)},
@@ -313,9 +361,10 @@ async def triage_issue(
         title=issue.title,
         clone_url=clone_url,
         default_branch=repo.default_branch,
-        author_name=settings.resolved_author_name,
+        author_name=author_name,
         author_email=settings.git_author_email,
         slot_uid=slot_uid,
+        **workspace_identity,
     )
     db.upsert_issue(
         key=key,
@@ -334,6 +383,11 @@ async def triage_issue(
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        item_key=key,
+        supports_question_autoclose=forge_event is None,
+        bot_login=bot_login,
+        author_name=author_name,
+        instance_id=forge_event.item.repository.instance_id if forge_event is not None else settings.github_instance_id,
         attempts=attempts,
         slot_uid=slot_uid,
         natives_cache=sandbox.natives_cache,
@@ -426,16 +480,23 @@ async def handle_comment(
     github: GitHubBackend,
     sandbox: SandboxManager,
     git_transport: GitTransport,
-    payload: Mapping[str, Any],
     delivery_id: str,
+    payload: Mapping[str, Any] | None = None,
+    forge_event: ForgeEvent | None = None,
     attempts: int = 0,
     slot_uid: int | None = None,
 ) -> None:
-    repo, issue = await _resolve_repo_and_issue(github, payload)
-    key = issue_key(repo.full_name, issue.number)
+    repo, issue = (
+        await _resolve_repo_and_issue(github, payload, forge_event)
+        if forge_event is not None
+        else await _resolve_repo_and_issue(github, payload)
+    )
+    key = forge_event.item.key if forge_event is not None else issue_key(repo.full_name, issue.number)
     existing = db.get_issue(key)
-    directive = _directive_from_payload(payload)
-    comment = _comment_from_payload(payload)
+    directive = _directive_from_payload(payload) if payload is not None else None
+    comment = _comment_from_event(forge_event) if forge_event is not None else _comment_from_payload(payload or {})
+    workspace_identity = _workspace_identity(forge_event)
+    author_name, bot_login = _forge_actor(settings, forge_event)
     clone_url = repo.clone_url
 
     if existing is None:
@@ -454,9 +515,10 @@ async def handle_comment(
             title=issue.title,
             clone_url=clone_url,
             default_branch=repo.default_branch,
-            author_name=settings.resolved_author_name,
+            author_name=author_name,
             author_email=settings.git_author_email,
             slot_uid=slot_uid,
+            **workspace_identity,
         )
         db.upsert_issue(
             key=key,
@@ -475,6 +537,13 @@ async def handle_comment(
             issue=issue,
             workspace=workspace,
             delivery_id=delivery_id,
+            item_key=key,
+            supports_question_autoclose=forge_event is None,
+            bot_login=bot_login,
+            author_name=author_name,
+            instance_id=forge_event.item.repository.instance_id
+            if forge_event is not None
+            else settings.github_instance_id,
             attempts=attempts,
             slot_uid=slot_uid,
             natives_cache=sandbox.natives_cache,
@@ -498,7 +567,12 @@ async def handle_comment(
         # Maintainer reopen: tear down stale workspace, reset state, branch
         # afresh from default. The old branch may have been merged/deleted.
         log.info("directive reopen", extra={"key": key, "from_state": existing.state, "author": directive.author})
-        await _run_workspace_op(sandbox.remove_workspace, repo=repo.full_name, number=issue.number)
+        await _run_workspace_op(
+            sandbox.remove_workspace,
+            repo=repo.full_name,
+            number=issue.number,
+            **workspace_identity,
+        )
         db.upsert_issue(key=key, repo=repo.full_name, number=issue.number, state="reproducing")
         workspace = await _run_workspace_op(
             sandbox.ensure_workspace,
@@ -507,9 +581,10 @@ async def handle_comment(
             title=issue.title,
             clone_url=clone_url,
             default_branch=repo.default_branch,
-            author_name=settings.resolved_author_name,
+            author_name=author_name,
             author_email=settings.git_author_email,
             slot_uid=slot_uid,
+            **workspace_identity,
         )
         db.upsert_issue(
             key=key,
@@ -528,6 +603,13 @@ async def handle_comment(
             issue=issue,
             workspace=workspace,
             delivery_id=delivery_id,
+            item_key=key,
+            supports_question_autoclose=forge_event is None,
+            bot_login=bot_login,
+            author_name=author_name,
+            instance_id=forge_event.item.repository.instance_id
+            if forge_event is not None
+            else settings.github_instance_id,
             attempts=attempts,
             slot_uid=slot_uid,
             natives_cache=sandbox.natives_cache,
@@ -544,9 +626,10 @@ async def handle_comment(
         clone_url=clone_url,
         default_branch=repo.default_branch,
         existing_branch=existing.branch,
-        author_name=settings.resolved_author_name,
+        author_name=author_name,
         author_email=settings.git_author_email,
         slot_uid=slot_uid,
+        **workspace_identity,
     )
     inputs = TaskInputs(
         settings=settings,
@@ -557,6 +640,11 @@ async def handle_comment(
         issue=issue,
         workspace=workspace,
         delivery_id=delivery_id,
+        item_key=key,
+        supports_question_autoclose=forge_event is None,
+        bot_login=bot_login,
+        author_name=author_name,
+        instance_id=forge_event.item.repository.instance_id if forge_event is not None else settings.github_instance_id,
         attempts=attempts,
         slot_uid=slot_uid,
         natives_cache=sandbox.natives_cache,

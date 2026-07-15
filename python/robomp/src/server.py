@@ -19,16 +19,23 @@ from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings, get_settings
 from robomp.dashboard import render_index, static_dir, tail_jsonl
 from robomp.db import (
+    DEFAULT_GITHUB_INSTANCE,
     INACTIVE_EVENT_STATES,
     Database,
+    EventRow,
+    canonical_item_key,
     get_database,
     iso_seconds_ago,
 )
 from robomp.db import (
     issue_key as make_issue_key,
 )
+from robomp.forge import ForgeInstance, WebhookAdapter
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueSummary
+from robomp.gitlab_compat import GitLabIssueBackend
+from robomp.gitlab_events import GitLabWebhookAdapter
+from robomp.gitlab_proxy_client import GitLabProxyClient, GitLabProxyGitTransport
 from robomp.manual_triage import (
     InvalidIssueRef,
     ManualTriageConflict,
@@ -38,7 +45,7 @@ from robomp.manual_triage import (
 )
 from robomp.natives_cache import NativesCache
 from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
-from robomp.queue import WorkerPool
+from robomp.queue import ForgeRuntime, WorkerPool
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
@@ -235,7 +242,136 @@ def _build_orchestrator(cfg: Settings) -> tuple[GitHubBackend, ProxyGitTransport
     return github, transport
 
 
-def _build_state(settings: Settings) -> dict[str, Any]:
+def _build_forge_runtime_factories(
+    cfg: Settings,
+    *,
+    natives_cache: NativesCache | None,
+) -> dict[str, Callable[[EventRow], ForgeRuntime]]:
+    if not cfg.gitlab_enabled:
+        return {}
+    base_url, key = _require_proxy_mode(cfg)
+    client = GitLabProxyClient(base_url=base_url, hmac_key=key)
+    runtime_components: dict[int, tuple[GitLabProxyGitTransport, SandboxManager]] = {}
+
+    def gitlab_runtime(row: EventRow) -> ForgeRuntime:
+        if row.repository_id is None:
+            raise RuntimeError("GitLab event has no immutable project id")
+        try:
+            project_id = int(row.repository_id)
+        except ValueError as exc:
+            raise RuntimeError("GitLab project id is invalid") from exc
+        if project_id not in cfg.gitlab_project_ids:
+            raise RuntimeError("GitLab project is not allowlisted")
+        components = runtime_components.get(project_id)
+        if components is None:
+            transport = GitLabProxyGitTransport(
+                project_id=project_id,
+                base_url=base_url,
+                hmac_key=key,
+                timeout=cfg.gh_proxy_git_timeout_seconds,
+            )
+            sandbox = SandboxManager(
+                cfg.workspace_root,
+                transport=transport,
+                natives_cache=natives_cache,
+            )
+            components = (transport, sandbox)
+            runtime_components[project_id] = components
+        transport, sandbox = components
+        backend = GitLabIssueBackend(
+            client,
+            project_id=project_id,
+            repository=row.repo or "",
+        )
+        return ForgeRuntime(backend=backend, sandbox=sandbox, git_transport=transport)
+
+    return {cfg.gitlab_instance_id: gitlab_runtime}
+
+
+def _build_webhook_adapters(
+    settings: Settings,
+    injected: Mapping[str, WebhookAdapter] | None = None,
+) -> dict[str, WebhookAdapter]:
+    adapters: dict[str, WebhookAdapter] = {}
+    if settings.gitlab_enabled:
+        assert settings.gitlab_base_url is not None
+        assert settings.gitlab_webhook_secret is not None
+        instance = ForgeInstance(
+            id=settings.gitlab_instance_id,
+            kind="gitlab",
+            base_url=settings.gitlab_base_url,
+            api_url=f"{settings.gitlab_base_url}/api/v4",
+        )
+        adapters[instance.id] = GitLabWebhookAdapter(
+            instance,
+            webhook_token=settings.gitlab_webhook_secret.get_secret_value(),
+            allowed_project_ids=settings.gitlab_project_ids,
+            bot_username=settings.gitlab_bot_login,
+            trigger_label=settings.gitlab_trigger_label,
+        )
+    if injected:
+        adapters.update(injected)
+    for instance_id, adapter in adapters.items():
+        if adapter.instance.id != instance_id:
+            raise ValueError(f"webhook adapter key {instance_id!r} does not match instance {adapter.instance.id!r}")
+    return adapters
+
+
+def _github_event_metadata(
+    cfg: Settings,
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    repo: str | None,
+    legacy_issue_key: str | None,
+    routed_task: str | None,
+) -> dict[str, Any]:
+    repository = payload.get("repository")
+    repository_data = repository if isinstance(repository, Mapping) else {}
+    remote_id = repository_data.get("id")
+    repository_id = str(remote_id) if remote_id not in (None, "") else repo
+
+    number: int | None = None
+    if legacy_issue_key:
+        _, separator, raw_number = legacy_issue_key.rpartition("#")
+        if separator:
+            try:
+                number = int(raw_number)
+            except ValueError:
+                pass
+    if number is None:
+        item = payload.get("pull_request") or payload.get("issue") or {}
+        candidate = item.get("number") if isinstance(item, Mapping) else None
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            number = candidate
+
+    item_kind = (
+        "change"
+        if event_type.startswith("pull_request")
+        or routed_task in {"review_pr", "handle_pr_conversation", "handle_review"}
+        else "issue"
+    )
+    task_kind = "review_change" if routed_task == "review_pr" else routed_task
+    canonical_key = (
+        canonical_item_key(cfg.github_instance_id, repository_id, item_kind, number)
+        if repository_id and number is not None
+        else None
+    )
+    return {
+        "instance_id": cfg.github_instance_id,
+        "repository_id": repository_id,
+        "item_kind": item_kind,
+        "item_number": number,
+        "canonical_key": canonical_key,
+        "task_kind": task_kind,
+    }
+
+
+def _build_state(
+    settings: Settings,
+    *,
+    webhook_adapters: Mapping[str, WebhookAdapter] | None = None,
+) -> dict[str, Any]:
     db = get_database(settings.sqlite_path)
     github, git_transport = _build_orchestrator(settings)
     natives_cache: NativesCache | None = None
@@ -250,7 +386,17 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         transport=git_transport,
         natives_cache=natives_cache,
     )
-    pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
+    pool = WorkerPool(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=git_transport,
+        forge_runtime_factories=_build_forge_runtime_factories(
+            settings,
+            natives_cache=natives_cache,
+        ),
+    )
     autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
     return {
         "settings": settings,
@@ -261,18 +407,23 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         "natives_cache": natives_cache,
         "pool": pool,
         "issue_browse_cache": _IssueBrowseCache(),
+        "webhook_adapters": _build_webhook_adapters(settings, webhook_adapters),
         "autoclose": autoclose,
     }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    webhook_adapters: Mapping[str, WebhookAdapter] | None = None,
+) -> FastAPI:
     """Build the FastAPI app. `settings` parameter is for tests."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or get_settings()
         cfg.ensure_paths()
-        app.state.bag = _build_state(cfg)
+        app.state.bag = _build_state(cfg, webhook_adapters=webhook_adapters)
         app.state.bag["started_at"] = time.time()
         pool: WorkerPool = app.state.bag["pool"]
         await pool.start()
@@ -309,6 +460,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> JSONResponse:
         bag = request.app.state.bag
         cfg: Settings = bag["settings"]
+        if cfg.github_webhook_secret is None or not cfg.bot_login or not cfg.repo_allowlist:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "GitHub ingress is not configured")
         body = await request.body()
         if not github_events.verify_signature(
             cfg.github_webhook_secret.get_secret_value(),
@@ -385,6 +538,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "authorizes_impl": decision.directive_authorizes_impl,
             }
 
+        github_metadata = _github_event_metadata(
+            cfg,
+            x_github_event,
+            payload,
+            repo=decision.repo,
+            legacy_issue_key=decision.issue_key,
+            routed_task=decision.task,
+        )
+
         if not decision.should_queue:
             log.info("skip", extra={"event": x_github_event, "reason": decision.reason})
             db.record_event(
@@ -395,6 +557,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 payload=payload,
                 state="skipped",
                 last_error=decision.reason,
+                **github_metadata,
             )
             return JSONResponse({"delivery": x_github_delivery, "state": "skipped"}, status_code=202)
 
@@ -440,6 +603,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     payload=payload,
                     state="skipped",
                     last_error=reason,
+                    **github_metadata,
                 )
                 return JSONResponse(
                     {"delivery": x_github_delivery, "state": "skipped", "reason": "rate_limited"},
@@ -453,6 +617,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             issue_key=decision.issue_key,
             payload=payload,
             state="queued",
+            **github_metadata,
         )
         if inserted:
             pool: WorkerPool = bag["pool"]
@@ -464,11 +629,138 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log.info("duplicate", extra={"event": x_github_event, "delivery": x_github_delivery})
         return JSONResponse({"delivery": x_github_delivery, "state": "queued"}, status_code=202)
 
+    @app.post("/webhook/{instance_id}")
+    async def forge_webhook(instance_id: str, request: Request) -> JSONResponse:
+        bag = request.app.state.bag
+        adapters: Mapping[str, WebhookAdapter] = bag["webhook_adapters"]
+        adapter = adapters.get(instance_id)
+        if adapter is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown forge instance")
+
+        body = await request.body()
+        try:
+            delivery_id = adapter.verify(request.headers, body)
+        except PermissionError as exc:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid webhook credentials") from exc
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"invalid json: {exc}") from exc
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "webhook payload must be an object")
+
+        event = adapter.normalize(
+            delivery_id=delivery_id,
+            headers=request.headers,
+            payload=payload,
+        )
+        if event is None:
+            return JSONResponse({"delivery": delivery_id, "state": "skipped"}, status_code=202)
+        if event.item.repository.instance_id != instance_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "normalized event instance mismatch")
+
+        cfg: Settings = bag["settings"]
+        if adapter.instance.kind == "gitlab" and cfg.gitlab_enabled and instance_id == cfg.gitlab_instance_id:
+            try:
+                project_id = int(event.item.repository.remote_id)
+            except ValueError:
+                project_id = -1
+            if project_id not in cfg.gitlab_project_ids:
+                return JSONResponse({"delivery": delivery_id, "state": "skipped"}, status_code=202)
+
+        db: Database = bag["db"]
+        if event.task_kind in {"handle_comment", "handle_pr_conversation"} and not db.has_activated_item(
+            event.item.key
+        ):
+            db.record_event(
+                instance_id=instance_id,
+                delivery_id=event.delivery_id,
+                event_type=event.source_event,
+                canonical_event=event.event,
+                task_kind=event.task_kind,
+                repo=event.item.repository.full_name,
+                repository_id=event.item.repository.remote_id,
+                item_kind=event.item.kind,
+                item_number=event.item.number,
+                canonical_key=event.item.key,
+                issue_key=event.item.key,
+                payload=event.to_dict(),
+                state="skipped",
+                last_error="work item is not activated",
+            )
+            return JSONResponse({"delivery": event.delivery_id, "state": "skipped"}, status_code=202)
+        if event.task_kind != "cleanup_workspace":
+            actor_login = event.actor.login.casefold()
+            unlimited = cfg.rate_limit_unlimited | cfg.maintainer_logins
+            cap = None if actor_login in unlimited else cfg.rate_limit_default
+            admission = db.admit_submission(
+                delivery_id=f"{instance_id}:{event.delivery_id}",
+                login=f"{instance_id}:{event.actor.remote_id}",
+                repo=event.item.key,
+                since=iso_seconds_ago(cfg.rate_limit_window_seconds),
+                cap=cap,
+            )
+            if not admission.accepted:
+                db.record_event(
+                    instance_id=instance_id,
+                    delivery_id=event.delivery_id,
+                    event_type=event.source_event,
+                    canonical_event=event.event,
+                    task_kind=event.task_kind,
+                    repo=event.item.repository.full_name,
+                    repository_id=event.item.repository.remote_id,
+                    item_kind=event.item.kind,
+                    item_number=event.item.number,
+                    canonical_key=event.item.key,
+                    issue_key=event.item.key,
+                    payload=event.to_dict(),
+                    state="skipped",
+                    last_error="rate limited",
+                )
+                return JSONResponse(
+                    {"delivery": event.delivery_id, "instance": instance_id, "state": "skipped"},
+                    status_code=202,
+                )
+        inserted = db.record_event(
+            instance_id=instance_id,
+            delivery_id=event.delivery_id,
+            event_type=event.source_event,
+            canonical_event=event.event,
+            task_kind=event.task_kind,
+            repo=event.item.repository.full_name,
+            repository_id=event.item.repository.remote_id,
+            item_kind=event.item.kind,
+            item_number=event.item.number,
+            canonical_key=event.item.key,
+            issue_key=event.item.key,
+            payload=event.to_dict(),
+            state="queued",
+        )
+        if inserted:
+            pool: WorkerPool = bag["pool"]
+            pool.wake()
+            log.info(
+                "queued",
+                extra={
+                    "instance": instance_id,
+                    "delivery": event.delivery_id,
+                    "task_kind": event.task_kind,
+                    "key": event.item.key,
+                },
+            )
+        else:
+            log.info("duplicate", extra={"instance": instance_id, "delivery": event.delivery_id})
+        return JSONResponse(
+            {"delivery": event.delivery_id, "instance": instance_id, "state": "queued"},
+            status_code=202,
+        )
+
     @app.post("/replay")
     async def replay(
         request: Request,
         x_robomp_token: str | None = Header(None, alias="X-Robomp-Replay-Token"),
         delivery_id: str = "",
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
     ) -> JSONResponse:
         bag = request.app.state.bag
         cfg: Settings = bag["settings"]
@@ -477,13 +769,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if x_robomp_token != cfg.replay_token.get_secret_value():
             raise HTTPException(401, "invalid replay token")
         db: Database = bag["db"]
-        row = db.get_event(delivery_id)
+        row = db.get_event(delivery_id, instance_id=instance_id)
         if row is None:
             raise HTTPException(404, "unknown delivery")
-        if not db.requeue_event(delivery_id, from_states=INACTIVE_EVENT_STATES):
+        if not db.requeue_event(delivery_id, instance_id=instance_id, from_states=INACTIVE_EVENT_STATES):
             raise HTTPException(409, f"delivery {delivery_id} is {row.state}; only inactive events can be replayed")
         bag["pool"].wake()
-        return JSONResponse({"delivery": delivery_id, "state": "queued"})
+        return JSONResponse({"delivery": delivery_id, "instance": instance_id, "state": "queued"})
 
     def _require_trigger_token(cfg: Settings, token: str | None) -> None:
         if cfg.replay_token is None:
@@ -606,6 +898,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         # mode == "retry"
+        instance_id = payload.get("instance_id", DEFAULT_GITHUB_INSTANCE)
+        if not isinstance(instance_id, str) or not instance_id:
+            raise HTTPException(400, "instance_id must be a non-empty string")
         if isinstance(delivery_id, str) and delivery_id:
             target = delivery_id
         elif isinstance(issue_ref, str) and issue_ref:
@@ -619,18 +914,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if row is None:
                 raise HTTPException(404, f"no retryable stored event for {repo_full}#{number}")
             target = row.delivery_id
+            instance_id = row.instance_id
         else:
             raise HTTPException(400, "retry requires 'delivery_id' or 'issue'")
 
-        event = db.get_event(target)
+        event = db.get_event(target, instance_id=instance_id)
         if event is None:
             raise HTTPException(404, f"unknown delivery {target}")
-        if not db.requeue_event(target, from_states=INACTIVE_EVENT_STATES):
+        if not db.requeue_event(target, instance_id=instance_id, from_states=INACTIVE_EVENT_STATES):
             raise HTTPException(409, f"delivery {target} is {event.state}; only inactive events can be retried")
         pool.wake()
-        log.info("manual retry", extra={"delivery": target})
+        log.info("manual retry", extra={"delivery": target, "instance": instance_id})
         return JSONResponse(
-            {"delivery": target, "state": "queued", "mode": "retry"},
+            {"delivery": target, "instance": instance_id, "state": "queued", "mode": "retry"},
             status_code=202,
         )
 
@@ -650,22 +946,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         delivery_id = payload.get("delivery_id")
         if not isinstance(delivery_id, str) or not delivery_id:
             raise HTTPException(400, "cancel requires 'delivery_id'")
+        instance_id = payload.get("instance_id", DEFAULT_GITHUB_INSTANCE)
+        if not isinstance(instance_id, str) or not instance_id:
+            raise HTTPException(400, "instance_id must be a non-empty string")
 
         db: Database = bag["db"]
-        event = db.get_event(delivery_id)
+        event = db.get_event(delivery_id, instance_id=instance_id)
         if event is None:
             raise HTTPException(404, f"unknown delivery {delivery_id}")
         if event.state != "running":
-            raise HTTPException(409, f"delivery {delivery_id} is {event.state}; only running deliveries can be cancelled")
+            raise HTTPException(
+                409, f"delivery {delivery_id} is {event.state}; only running deliveries can be cancelled"
+            )
 
         pool: WorkerPool = bag["pool"]
-        fired = await pool.cancel_event(delivery_id)
+        fired = await pool.cancel_event(event.dispatch_id)
         log.info(
             "manual cancel",
             extra={"delivery": delivery_id, "fired": fired, "state": event.state},
         )
         return JSONResponse(
-            {"delivery": delivery_id, "fired": fired, "previous_state": event.state},
+            {"delivery": delivery_id, "instance": instance_id, "fired": fired, "previous_state": event.state},
             status_code=202,
         )
 

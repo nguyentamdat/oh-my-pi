@@ -15,6 +15,8 @@ from typing import Any, Literal
 EventState = Literal["queued", "running", "done", "failed", "skipped"]
 INACTIVE_EVENT_STATES: tuple[EventState, ...] = ("done", "failed", "skipped")
 
+DEFAULT_GITHUB_INSTANCE = "github-main"
+
 IssueState = Literal[
     "new",
     "reproducing",
@@ -33,9 +35,16 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS events (
-  delivery_id   TEXT PRIMARY KEY,
+  instance_id    TEXT NOT NULL,
+  delivery_id   TEXT NOT NULL,
   event_type    TEXT NOT NULL,
+  canonical_event TEXT,
+  task_kind     TEXT,
   repo          TEXT,
+  repository_id TEXT,
+  item_kind     TEXT,
+  item_number   INTEGER,
+  canonical_key TEXT,
   issue_key     TEXT,
   payload_json  TEXT NOT NULL,
   received_at   TEXT NOT NULL,
@@ -45,11 +54,14 @@ CREATE TABLE IF NOT EXISTS events (
   last_error    TEXT,
   started_at    TEXT,
   finished_at   TEXT,
-  model         TEXT
+  model         TEXT,
+  available_at  TEXT,
+  PRIMARY KEY (instance_id, delivery_id)
 );
 
 CREATE INDEX IF NOT EXISTS events_state_received
   ON events(state, received_at);
+
 
 CREATE INDEX IF NOT EXISTS events_issue_state
   ON events(issue_key, state);
@@ -141,6 +153,24 @@ class EventRow:
     state: EventState
     attempts: int
     last_error: str | None
+    instance_id: str = DEFAULT_GITHUB_INSTANCE
+    repository_id: str | None = None
+    item_kind: str | None = None
+    item_number: int | None = None
+    canonical_key: str | None = None
+    canonical_event: str | None = None
+    task_kind: str | None = None
+
+    @property
+    def queue_key(self) -> str:
+        return self.canonical_key or self.issue_key or f"{self.instance_id}:{self.delivery_id}"
+
+    @property
+    def dispatch_id(self) -> str:
+        """Cancellation key; legacy GitHub deliveries retain their public ID."""
+        if self.instance_id == DEFAULT_GITHUB_INSTANCE:
+            return self.delivery_id
+        return f"{self.instance_id}:{self.delivery_id}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -180,6 +210,13 @@ def _event_row_from_db_row(row: sqlite3.Row) -> EventRow:
         state=row["state"],
         attempts=int(row["attempts"]),
         last_error=row["last_error"],
+        instance_id=row["instance_id"],
+        repository_id=row["repository_id"],
+        item_kind=row["item_kind"],
+        item_number=row["item_number"],
+        canonical_key=row["canonical_key"],
+        canonical_event=row["canonical_event"],
+        task_kind=row["task_kind"],
     )
 
 
@@ -226,6 +263,65 @@ def issue_key(repo: str, number: int) -> str:
     return f"{repo}#{number}"
 
 
+def canonical_item_key(instance_id: str, repository_id: str, item_kind: str, number: int) -> str:
+    """Stable work-item identity shared by persistence and queue serialization."""
+    return f"{instance_id}:{repository_id}:{item_kind}:{number}"
+
+
+def _legacy_event_metadata(
+    event_type: str,
+    payload: Mapping[str, Any],
+    repo: str | None,
+    legacy_issue_key: str | None,
+) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    """Infer canonical metadata for pre-forge GitHub rows and callers."""
+    repository = payload.get("repository")
+    repository_data = repository if isinstance(repository, Mapping) else {}
+    raw_repository_id = repository_data.get("id")
+    repository_id = str(raw_repository_id) if raw_repository_id not in (None, "") else repo
+
+    action = str(payload.get("action") or "")
+    issue = payload.get("issue")
+    issue_data = issue if isinstance(issue, Mapping) else {}
+    pull_request = payload.get("pull_request")
+    pull_request_data = pull_request if isinstance(pull_request, Mapping) else {}
+
+    task_kind: str | None = None
+    canonical_event: str | None = None
+    item_kind = "issue"
+    if event_type == "issues":
+        if action == "opened":
+            task_kind, canonical_event = "triage_issue", "issue.opened"
+        elif action == "closed":
+            task_kind, canonical_event = "cleanup_workspace", "issue.closed"
+    elif event_type == "issue_comment" and action == "created":
+        task_kind = "handle_pr_conversation" if "pull_request" in issue_data else "handle_comment"
+        canonical_event = "issue.comment.created"
+    elif event_type == "pull_request":
+        item_kind = "change"
+        if action in {"opened", "reopened", "ready_for_review", "labeled"}:
+            task_kind, canonical_event = "review_change", "change.opened"
+        elif action == "closed":
+            task_kind = "cleanup_workspace"
+            canonical_event = "change.merged" if bool(pull_request_data.get("merged")) else "change.closed"
+    elif event_type == "pull_request_review_comment" and action == "created":
+        task_kind, canonical_event = "handle_review", "change.review.created"
+
+    number: int | None = None
+    if legacy_issue_key:
+        _, separator, raw_number = legacy_issue_key.rpartition("#")
+        if separator:
+            try:
+                number = int(raw_number)
+            except ValueError:
+                pass
+    if number is None:
+        candidate = pull_request_data.get("number") or issue_data.get("number")
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            number = candidate
+    return repository_id, item_kind, number, task_kind, canonical_event
+
+
 class Database:
     """Thread-safe sqlite wrapper. One connection per thread via locks."""
 
@@ -239,16 +335,123 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._migrate()
 
+    @staticmethod
+    def _create_events_v2(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE events_v2 (
+              instance_id TEXT NOT NULL,
+              delivery_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              canonical_event TEXT,
+              task_kind TEXT,
+              repo TEXT,
+              repository_id TEXT,
+              item_kind TEXT,
+              item_number INTEGER,
+              canonical_key TEXT,
+              issue_key TEXT,
+              payload_json TEXT NOT NULL,
+              received_at TEXT NOT NULL,
+              state TEXT NOT NULL
+                CHECK (state IN ('queued','running','done','failed','skipped')),
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              started_at TEXT,
+              finished_at TEXT,
+              model TEXT,
+              available_at TEXT,
+              PRIMARY KEY (instance_id, delivery_id)
+            )
+            """
+        )
+
+    def _migrate_events(self) -> None:
+        info = self._conn.execute("PRAGMA table_info(events)").fetchall()
+        columns = {row[1] for row in info}
+        primary_key = [row[1] for row in sorted((row for row in info if row[5]), key=lambda row: row[5])]
+        required = {
+            "instance_id",
+            "repository_id",
+            "item_kind",
+            "item_number",
+            "canonical_key",
+            "canonical_event",
+            "task_kind",
+            "model",
+            "available_at",
+        }
+        if primary_key == ["instance_id", "delivery_id"] and required <= columns:
+            return
+
+        with self._txn() as conn:
+            rows = conn.execute("SELECT * FROM events").fetchall()
+            conn.execute("DROP TABLE IF EXISTS events_v2")
+            self._create_events_v2(conn)
+            for row in rows:
+                names = set(row.keys())
+                payload = json.loads(row["payload_json"])
+                legacy_key = row["issue_key"] if "issue_key" in names else None
+                repo = row["repo"] if "repo" in names else None
+                repository_id, item_kind, item_number, task_kind, canonical_event = _legacy_event_metadata(
+                    row["event_type"], payload, repo, legacy_key
+                )
+                instance_id = (row["instance_id"] if "instance_id" in names else None) or DEFAULT_GITHUB_INSTANCE
+                if "repository_id" in names and row["repository_id"]:
+                    repository_id = row["repository_id"]
+                if "item_kind" in names and row["item_kind"]:
+                    item_kind = row["item_kind"]
+                if "item_number" in names and row["item_number"] is not None:
+                    item_number = int(row["item_number"])
+                canonical_key = row["canonical_key"] if "canonical_key" in names else None
+                if canonical_key is None and repository_id and item_kind and item_number is not None:
+                    canonical_key = canonical_item_key(instance_id, repository_id, item_kind, item_number)
+                conn.execute(
+                    """
+                    INSERT INTO events_v2 (
+                      instance_id, delivery_id, event_type, canonical_event, task_kind,
+                      repo, repository_id, item_kind, item_number, canonical_key, issue_key,
+                      payload_json, received_at, state, attempts, last_error, started_at,
+                      finished_at, model, available_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        instance_id,
+                        row["delivery_id"],
+                        row["event_type"],
+                        (row["canonical_event"] if "canonical_event" in names else None) or canonical_event,
+                        (row["task_kind"] if "task_kind" in names else None) or task_kind,
+                        repo,
+                        repository_id,
+                        item_kind,
+                        item_number,
+                        canonical_key,
+                        legacy_key,
+                        row["payload_json"],
+                        row["received_at"],
+                        row["state"],
+                        row["attempts"] if "attempts" in names else 0,
+                        row["last_error"] if "last_error" in names else None,
+                        row["started_at"] if "started_at" in names else None,
+                        row["finished_at"] if "finished_at" in names else None,
+                        row["model"] if "model" in names else None,
+                        row["available_at"] if "available_at" in names else None,
+                    ),
+                )
+            conn.execute("DROP TABLE events")
+            conn.execute("ALTER TABLE events_v2 RENAME TO events")
+
+        self._conn.execute("CREATE INDEX IF NOT EXISTS events_state_received ON events(state, received_at)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS events_item_state ON events(canonical_key, state)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS events_issue_state ON events(issue_key, state)")
+
     def _migrate(self) -> None:
         # SQLite-friendly forward migrations. Each is idempotent.
         issue_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "classification" not in issue_cols:
             self._conn.execute("ALTER TABLE issues ADD COLUMN classification TEXT")
-        event_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()}
-        if "model" not in event_cols:
-            self._conn.execute("ALTER TABLE events ADD COLUMN model TEXT")
-        if "available_at" not in event_cols:
-            self._conn.execute("ALTER TABLE events ADD COLUMN available_at TEXT")
+        self._migrate_events()
+        self._conn.execute("CREATE INDEX IF NOT EXISTS events_item_state ON events(canonical_key, state)")
 
     def close(self) -> None:
         with self._lock:
@@ -276,24 +479,44 @@ class Database:
         payload: Mapping[str, Any],
         state: EventState = "queued",
         last_error: str | None = None,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
+        repository_id: str | None = None,
+        item_kind: str | None = None,
+        item_number: int | None = None,
+        canonical_key: str | None = None,
+        canonical_event: str | None = None,
+        task_kind: str | None = None,
     ) -> bool:
-        """Insert a webhook event. Returns False if duplicate (by delivery id).
-
-        `last_error` is the reason text surfaced on the dashboard for non-queued
-        states (skipped, failed). Ignored when state == 'queued'.
-        """
+        """Insert a webhook event, deduplicated within its forge instance."""
+        inferred = _legacy_event_metadata(event_type, payload, repo, issue_key)
+        repository_id = repository_id or inferred[0]
+        item_kind = item_kind or inferred[1]
+        item_number = item_number if item_number is not None else inferred[2]
+        task_kind = task_kind or inferred[3]
+        canonical_event = canonical_event or inferred[4]
+        if canonical_key is None and repository_id and item_kind and item_number is not None:
+            canonical_key = canonical_item_key(instance_id, repository_id, item_kind, item_number)
         now = _utcnow()
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT OR IGNORE INTO events
-                  (delivery_id, event_type, repo, issue_key, payload_json, received_at, state, last_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO events (
+                  instance_id, delivery_id, event_type, canonical_event, task_kind,
+                  repo, repository_id, item_kind, item_number, canonical_key, issue_key,
+                  payload_json, received_at, state, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    instance_id,
                     delivery_id,
                     event_type,
+                    canonical_event,
+                    task_kind,
                     repo,
+                    repository_id,
+                    item_kind,
+                    item_number,
+                    canonical_key,
                     issue_key,
                     json.dumps(payload, separators=(",", ":")),
                     now,
@@ -304,27 +527,30 @@ class Database:
             return cur.rowcount > 0
 
     def claim_next_event(self) -> EventRow | None:
-        """Atomically dequeue one unblocked queued event into running state."""
+        """Atomically dequeue one canonically-unblocked queued event."""
         with self._txn() as conn:
             now = _utcnow()
             row = conn.execute(
                 """
-                SELECT queued.delivery_id, queued.event_type, queued.repo, queued.issue_key,
-                       queued.payload_json, queued.received_at, queued.state, queued.attempts,
-                       queued.last_error
+                SELECT queued.instance_id, queued.delivery_id, queued.event_type,
+                       queued.canonical_event, queued.task_kind, queued.repo,
+                       queued.repository_id, queued.item_kind, queued.item_number,
+                       queued.canonical_key, queued.issue_key, queued.payload_json,
+                       queued.received_at, queued.state, queued.attempts, queued.last_error
                 FROM events AS queued
                 WHERE queued.state = 'queued'
                   AND (queued.available_at IS NULL OR queued.available_at <= ?)
                   AND (
-                    queued.issue_key IS NULL
+                    COALESCE(queued.canonical_key, queued.issue_key) IS NULL
                     OR NOT EXISTS (
                       SELECT 1
                       FROM events AS running
                       WHERE running.state = 'running'
-                        AND running.issue_key = queued.issue_key
+                        AND COALESCE(running.canonical_key, running.issue_key)
+                            = COALESCE(queued.canonical_key, queued.issue_key)
                     )
                   )
-                ORDER BY queued.received_at
+                ORDER BY queued.received_at, queued.rowid
                 LIMIT 1
                 """,
                 (now,),
@@ -332,8 +558,12 @@ class Database:
             if row is None:
                 return None
             conn.execute(
-                "UPDATE events SET state='running', attempts=attempts+1, started_at=? WHERE delivery_id=?",
-                (now, row["delivery_id"]),
+                """
+                UPDATE events
+                SET state='running', attempts=attempts+1, started_at=?
+                WHERE instance_id=? AND delivery_id=?
+                """,
+                (now, row["instance_id"], row["delivery_id"]),
             )
             return EventRow(
                 delivery_id=row["delivery_id"],
@@ -345,25 +575,44 @@ class Database:
                 state="running",
                 attempts=int(row["attempts"]) + 1,
                 last_error=row["last_error"],
+                instance_id=row["instance_id"],
+                repository_id=row["repository_id"],
+                item_kind=row["item_kind"],
+                item_number=row["item_number"],
+                canonical_key=row["canonical_key"],
+                canonical_event=row["canonical_event"],
+                task_kind=row["task_kind"],
             )
 
-    def mark_event(self, delivery_id: str, state: EventState, *, error: str | None = None) -> None:
+    def mark_event(
+        self,
+        delivery_id: str,
+        state: EventState,
+        *,
+        error: str | None = None,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE events SET state=?, last_error=?, finished_at=? WHERE delivery_id=?",
-                (state, error, _utcnow(), delivery_id),
+                """
+                UPDATE events SET state=?, last_error=?, finished_at=?
+                WHERE instance_id=? AND delivery_id=?
+                """,
+                (state, error, _utcnow(), instance_id, delivery_id),
             )
 
-    def set_event_model(self, delivery_id: str, model: str) -> None:
-        """Persist the model the worker actually picked for this event.
-
-        Called once per run, right after `pick_model()`, so the dashboard and
-        post-mortems can attribute behavior to the exact model used.
-        """
+    def set_event_model(
+        self,
+        delivery_id: str,
+        model: str,
+        *,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> None:
+        """Persist the model picked for one forge-instance delivery."""
         with self._lock:
             self._conn.execute(
-                "UPDATE events SET model=? WHERE delivery_id=?",
-                (model, delivery_id),
+                "UPDATE events SET model=? WHERE instance_id=? AND delivery_id=?",
+                (model, instance_id, delivery_id),
             )
 
     def reset_stuck_running(self) -> int:
@@ -378,33 +627,24 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error
+                SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
+                       repo, repository_id, item_kind, item_number, canonical_key,
+                       issue_key, payload_json, received_at, state, attempts, last_error
                 FROM events
                 ORDER BY received_at DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
-        return [
-            EventRow(
-                delivery_id=row["delivery_id"],
-                event_type=row["event_type"],
-                repo=row["repo"],
-                issue_key=row["issue_key"],
-                payload=json.loads(row["payload_json"]),
-                received_at=row["received_at"],
-                state=row["state"],
-                attempts=int(row["attempts"]),
-                last_error=row["last_error"],
-            )
-            for row in rows
-        ]
+        return [_event_row_from_db_row(row) for row in rows]
 
-    def remove_event(self, delivery_id: str) -> None:
-        """Hard-delete an event row. Used to clear stale state before a manual re-trigger."""
+    def remove_event(self, delivery_id: str, *, instance_id: str = DEFAULT_GITHUB_INSTANCE) -> None:
+        """Hard-delete one forge-instance delivery."""
         with self._lock:
-            self._conn.execute("DELETE FROM events WHERE delivery_id=?", (delivery_id,))
+            self._conn.execute(
+                "DELETE FROM events WHERE instance_id=? AND delivery_id=?",
+                (instance_id, delivery_id),
+            )
 
     def replace_event_if_state_in(
         self,
@@ -416,28 +656,49 @@ class Database:
         payload: Mapping[str, Any],
         state: EventState = "queued",
         allowed_existing_states: tuple[EventState, ...],
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
     ) -> bool:
-        """Replace an existing event only when its current state is permitted."""
+        """Replace one inactive forge-instance delivery atomically."""
+        repository_id, item_kind, item_number, task_kind, canonical_event = _legacy_event_metadata(
+            event_type, payload, repo, issue_key
+        )
+        canonical_key = (
+            canonical_item_key(instance_id, repository_id, item_kind, item_number)
+            if repository_id and item_kind and item_number is not None
+            else None
+        )
         now = _utcnow()
         with self._txn() as conn:
             row = conn.execute(
-                "SELECT state FROM events WHERE delivery_id = ?",
-                (delivery_id,),
+                "SELECT state FROM events WHERE instance_id=? AND delivery_id=?",
+                (instance_id, delivery_id),
             ).fetchone()
             if row is not None:
                 if row["state"] not in allowed_existing_states:
                     return False
-                conn.execute("DELETE FROM events WHERE delivery_id = ?", (delivery_id,))
+                conn.execute(
+                    "DELETE FROM events WHERE instance_id=? AND delivery_id=?",
+                    (instance_id, delivery_id),
+                )
             conn.execute(
                 """
-                INSERT INTO events
-                  (delivery_id, event_type, repo, issue_key, payload_json, received_at, state)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events (
+                  instance_id, delivery_id, event_type, canonical_event, task_kind,
+                  repo, repository_id, item_kind, item_number, canonical_key, issue_key,
+                  payload_json, received_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    instance_id,
                     delivery_id,
                     event_type,
+                    canonical_event,
+                    task_kind,
                     repo,
+                    repository_id,
+                    item_kind,
+                    item_number,
+                    canonical_key,
                     issue_key,
                     json.dumps(payload, separators=(",", ":")),
                     now,
@@ -457,8 +718,9 @@ class Database:
         with self._lock:
             row = self._conn.execute(
                 f"""
-                SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error
+                SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
+                       repo, repository_id, item_kind, item_number, canonical_key,
+                       issue_key, payload_json, received_at, state, attempts, last_error
                 FROM events
                 WHERE issue_key = ?
                   {state_filter}
@@ -489,8 +751,9 @@ class Database:
                 placeholders = ",".join("?" * len(batch))
                 rows = self._conn.execute(
                     f"""
-                    SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                           state, attempts, last_error
+                    SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
+                           repo, repository_id, item_kind, item_number, canonical_key,
+                           issue_key, payload_json, received_at, state, attempts, last_error
                     FROM events
                     WHERE issue_key IN ({placeholders})
                       {state_filter}
@@ -554,8 +817,9 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT e.delivery_id, e.event_type, e.repo, e.issue_key, e.received_at,
-                       e.started_at, e.attempts, e.model,
+                SELECT e.instance_id, e.delivery_id, e.event_type, e.canonical_event,
+                       e.task_kind, e.repo, e.repository_id, e.item_kind, e.item_number,
+                       e.canonical_key, e.issue_key, e.received_at, e.started_at, e.attempts, e.model,
                        (SELECT tool FROM tool_calls
                           WHERE issue_key = e.issue_key AND ts >= e.started_at
                           ORDER BY ts DESC LIMIT 1) AS last_tool,
@@ -583,29 +847,40 @@ class Database:
             for r in rows
         ]
 
-    def get_event(self, delivery_id: str) -> EventRow | None:
+    def get_event(
+        self,
+        delivery_id: str,
+        *,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> EventRow | None:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error
-                FROM events WHERE delivery_id = ?
+                SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
+                       repo, repository_id, item_kind, item_number, canonical_key,
+                       issue_key, payload_json, received_at, state, attempts, last_error
+                FROM events
+                WHERE instance_id=? AND delivery_id=?
                 """,
-                (delivery_id,),
+                (instance_id, delivery_id),
             ).fetchone()
-        if row is None:
-            return None
-        return EventRow(
-            delivery_id=row["delivery_id"],
-            event_type=row["event_type"],
-            repo=row["repo"],
-            issue_key=row["issue_key"],
-            payload=json.loads(row["payload_json"]),
-            received_at=row["received_at"],
-            state=row["state"],
-            attempts=int(row["attempts"]),
-            last_error=row["last_error"],
-        )
+        return _event_row_from_db_row(row) if row is not None else None
+
+    def has_activated_item(self, canonical_key: str) -> bool:
+        """Return whether a canonical item has an accepted activation event."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM events
+                WHERE canonical_key=?
+                  AND task_kind IN ('triage_issue', 'review_change')
+                  AND state <> 'skipped'
+                LIMIT 1
+                """,
+                (canonical_key,),
+            ).fetchone()
+        return row is not None
 
     def has_authorized_impl_event(self, issue_key: str) -> bool:
         """Return whether a non-skipped event on this issue carried implementation authorization."""
@@ -632,45 +907,48 @@ class Database:
         delivery_id: str,
         *,
         from_states: tuple[EventState, ...] | None = None,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
     ) -> bool:
-        """Move an event back to queued without clobbering last_error.
-
-        Returns True only when a row was actually transitioned. `from_states`
-        restricts which current states may be requeued; callers use this to
-        keep public retries from mutating queued/running rows while preserving
-        internal recovery of a just-claimed running event.
-        """
+        """Move one forge-instance event back to queued."""
         with self._lock:
             if from_states is None:
                 cur = self._conn.execute(
-                    "UPDATE events SET state='queued', available_at=NULL WHERE delivery_id=?",
-                    (delivery_id,),
+                    """
+                    UPDATE events SET state='queued', available_at=NULL
+                    WHERE instance_id=? AND delivery_id=?
+                    """,
+                    (instance_id, delivery_id),
                 )
             elif not from_states:
                 return False
             else:
                 placeholders = ",".join("?" for _ in from_states)
                 cur = self._conn.execute(
-                    f"UPDATE events SET state='queued', available_at=NULL WHERE delivery_id=? AND state IN ({placeholders})",
-                    (delivery_id, *from_states),
+                    f"""
+                    UPDATE events SET state='queued', available_at=NULL
+                    WHERE instance_id=? AND delivery_id=? AND state IN ({placeholders})
+                    """,
+                    (instance_id, delivery_id, *from_states),
                 )
             return cur.rowcount > 0
 
-    def schedule_retry(self, delivery_id: str, *, delay_seconds: float, error: str | None = None) -> bool:
-        """Re-queue a delivery for a future retry with backoff.
-
-        Flips state back to 'queued' but stamps `available_at` so
-        `claim_next_event` skips the row until the backoff elapses. `attempts`
-        is left untouched (it was already incremented at claim) so the retry
-        budget keeps counting down; `last_error` retains the failure reason for
-        the dashboard. Only transitions a 'running'/'failed' row; returns
-        whether a row changed.
-        """
+    def schedule_retry(
+        self,
+        delivery_id: str,
+        *,
+        delay_seconds: float,
+        error: str | None = None,
+        instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> bool:
+        """Schedule one forge-instance delivery for retry."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE events SET state='queued', last_error=?, available_at=?, finished_at=NULL "
-                "WHERE delivery_id=? AND state IN ('running','failed')",
-                (error, _utc_after(delay_seconds), delivery_id),
+                """
+                UPDATE events
+                SET state='queued', last_error=?, available_at=?, finished_at=NULL
+                WHERE instance_id=? AND delivery_id=? AND state IN ('running','failed')
+                """,
+                (error, _utc_after(delay_seconds), instance_id, delivery_id),
             )
             return cur.rowcount > 0
 
