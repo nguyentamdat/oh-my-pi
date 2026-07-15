@@ -118,6 +118,8 @@ class RoutingLLMClassifier:
                     "types": ["world", "experience"],
                     "budget": "low",
                     "max_tokens": 512,
+                    "tags": ["project:ica"],
+                    "tags_match": "any_strict",
                     "trace": False,
                 },
             )
