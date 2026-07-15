@@ -93,47 +93,76 @@ type `application/json`, secret = `GITHUB_WEBHOOK_SECRET`, events =
 request review comments*. GitHub's `ping` should produce
 `POST /webhook/github 202` within a second.
 
-### GitLab webhook — `gitlab.zingplay.com/ica/server`
+### GitLab project webhooks and intake routing
 
-The first GitLab target is immutable project ID `356` (`ica/server`) on
-GitLab `17.5.5-ee`. Configure the orchestrator with:
+GitLab integration is keyed by immutable numeric project IDs. It supports:
+
+- **Single-project mode:** omit `ROBOMP_GITLAB_ROUTING_POLICY`; an issue starts
+  work only after it carries `ROBOMP_GITLAB_TRIGGER_LABEL`.
+- **Routing mode:** configure one intake project plus explicit target projects.
+  Intake issues are classified before any repository is cloned.
+
+The orchestrator receives only routing metadata:
 
 ```dotenv
-ROBOMP_GITLAB_BASE_URL=https://gitlab.zingplay.com
-ROBOMP_GITLAB_PROJECT_IDS=356
-ROBOMP_GITLAB_BOT_LOGIN=<service-account-login>
+ROBOMP_GITLAB_BASE_URL=https://gitlab.example.com
+ROBOMP_GITLAB_PROJECT_IDS=2080,356
+ROBOMP_GITLAB_BOT_LOGIN=<legacy-primary-bot-login>
+ROBOMP_GITLAB_BOT_LOGINS=<routing-bot>,<intake-bot>,<target-bot>
 ROBOMP_GITLAB_TRIGGER_LABEL=roboomp
 ROBOMP_GITLAB_WEBHOOK_SECRET=<random-webhook-secret>
+ROBOMP_GITLAB_ROUTING_POLICY={"intake_project_id":2080,"targets":[{"key":"server","project_id":356,"mode":"auto_implement","default_branch":"main","paths":["server"],"aliases":["server"],"signals":["server runtime"]}]}
 ```
 
-Configure the credential-proxy container—not the orchestrator—with a
-project/group access token:
+Every policy target declares one mode:
+
+- `recommend`: keep the issue in intake, add `needs-routing` and
+  `suggest::<target>`, and wait for a maintainer.
+- `auto_move`: move a high-confidence issue, persist source-to-target lineage,
+  and add `routed` without starting repository work.
+- `auto_implement`: move first, then queue normal target-project triage only
+  after the canonical target project and IID are durable.
+
+`route::<target>` labels are deterministic maintainer overrides. Multiple
+route labels remain ambiguous. Before moving, roboomp verifies that the live
+target default branch exactly matches the policy. Move recovery resolves
+GitLab's global issue ID through GraphQL and then reads the issue through the
+allowlisted destination project; no administrator API or `sudo` scope is
+required.
+
+The credential-proxy—not the orchestrator—receives either the legacy token or
+the routed credential set:
 
 ```dotenv
+# Legacy single-token mode
 ROBOMP_GITLAB_TOKEN=<project-or-group-access-token>
+
+# Routed mode
+ROBOMP_GITLAB_ROUTING_TOKEN=<group-access-token-for-move-and-recovery>
+ROBOMP_GITLAB_PROJECT_TOKENS_JSON={"2080":"<intake-token>","356":"<target-token>"}
 ```
 
-The token needs project membership that can create/push `roboomp/*` branches,
-comment and label issues, and open merge requests. Use GitLab scopes `api` and
-`write_repository`; never grant admin or `sudo`. The token MUST NOT be present
-in the roboomp orchestrator or agent environment.
+Use `api` and `write_repository` scopes with the minimum project/group role
+needed. The routing token is used only for cross-project move/recovery. Each
+project token is selected by exact immutable project ID for ordinary API and
+Git operations. None of these token values may enter the orchestrator or agent
+environment. List every token's authenticated username in
+`ROBOMP_GITLAB_BOT_LOGINS`; their issue, label, move, and note webhooks are
+ignored to prevent feedback loops.
 
-In *Settings → Webhooks* for project `356`:
+Install the same **project hook** on the intake project and every allowlisted
+target. A group hook is neither required nor used:
 
-- URL: `https://<robomp-host>/webhook/gitlab-zingplay`
+- URL: `https://<robomp-host>/webhook/<instance-id>`
 - Secret token: same value as `ROBOMP_GITLAB_WEBHOOK_SECRET`
 - Enable: **Issues events**, **Comments**
-- Content type: JSON
+- SSL verification: enabled
 
-GitLab `17.5` uses `X-Gitlab-Token`; the receiver compares it in constant time.
-Only issues carrying the `roboomp` label are admitted. A later label-added
-Issue Hook activates an existing issue. Note Hooks resume only an already
-activated item; bot, system, internal, empty, and unrelated notes are ignored.
-Allowlisting uses numeric project ID `356`, never `ica/server` alone.
-
-Validate a deployment with a test issue: add `roboomp`, observe one queued
-event, one `roboomp/*` branch, one merge request, and a final issue comment.
-Re-delivery of the same event UUID MUST NOT create a second merge request.
+GitLab uses `X-Gitlab-Token`; the receiver compares it in constant time.
+Re-delivery of the same event UUID is idempotent. Validate routing with one
+issue per enabled mode: a recommendation stays in intake, an automatic move
+lands in the declared target with `routed`, and automatic implementation
+creates an `issue.routed` target event with task kind `triage_issue`.
 
 ### Configuration
 

@@ -49,6 +49,8 @@ services:
       ROBOMP_GITLAB_WEBHOOK_SECRET: ${ROBOMP_GITLAB_WEBHOOK_SECRET:-}
       ROBOMP_GITLAB_PROJECT_IDS: ${ROBOMP_GITLAB_PROJECT_IDS:-}
       ROBOMP_GITLAB_BOT_LOGIN: ${ROBOMP_GITLAB_BOT_LOGIN:-}
+      ROBOMP_GITLAB_BOT_LOGINS: ${ROBOMP_GITLAB_BOT_LOGINS:-}
+      ROBOMP_GITLAB_ROUTING_POLICY: ${ROBOMP_GITLAB_ROUTING_POLICY:-}
       ROBOMP_GITLAB_TRIGGER_LABEL: ${ROBOMP_GITLAB_TRIGGER_LABEL:-roboomp}
 
       # --- PR review / vouch gate ---
@@ -133,10 +135,11 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       # Shared with the orchestrator: HMAC verification key.
       ROBOMP_GH_PROXY_HMAC_KEY: ${ROBOMP_GH_PROXY_HMAC_KEY:?ROBOMP_GH_PROXY_HMAC_KEY must be set in .env}
-      # Optional GitLab PAT: lives ONLY in this credential proxy, never in
-      # the orchestrator's environment. When absent, GitLab proxy routes stay
-      # disabled while GitHub proxying continues normally.
+      # GitLab credentials live ONLY in this proxy. Use either the legacy
+      # single token or the routing token plus exact project-token map.
       ROBOMP_GITLAB_TOKEN: ${ROBOMP_GITLAB_TOKEN:-}
+      ROBOMP_GITLAB_ROUTING_TOKEN: ${ROBOMP_GITLAB_ROUTING_TOKEN:-}
+      ROBOMP_GITLAB_PROJECT_TOKENS_JSON: ${ROBOMP_GITLAB_PROJECT_TOKENS_JSON:-}
       ROBOMP_GITLAB_BASE_URL: ${ROBOMP_GITLAB_BASE_URL:-}
       ROBOMP_GITLAB_PROJECT_IDS: ${ROBOMP_GITLAB_PROJECT_IDS:-}
       # The proxy reuses the SandboxManager pool layout under /data/workspaces.
