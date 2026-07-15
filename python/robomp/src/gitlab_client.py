@@ -59,6 +59,8 @@ class GitLabIssueInfo:
     author: str
     labels: tuple[str, ...]
     web_url: str
+    id: int = 0
+    moved_to_id: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,7 +174,9 @@ class GitLabClient:
                 return notes
             page += 1
 
-    async def get_authenticated_user(self) -> GitLabUserInfo:
+    async def get_authenticated_user(self, project_id: int | None = None) -> GitLabUserInfo:
+        if project_id is not None:
+            self._project_path(project_id)
         data = await self.request("GET", "user")
         return _user_from_payload(data)
 
@@ -218,6 +222,38 @@ class GitLabClient:
             json={"state_event": "close"},
         )
         return _issue_from_payload(project_id, data)
+
+    async def move_issue(self, project_id: int, iid: int, to_project_id: int) -> GitLabIssueInfo:
+        """Move an issue between two configured GitLab projects."""
+        source_path = self._project_path(project_id)
+        self._project_path(to_project_id)
+        data = await self.request(
+            "POST",
+            f"{source_path}/issues/{_iid(iid)}/move",
+            json={"to_project_id": to_project_id},
+        )
+        return _issue_from_payload(to_project_id, data)
+
+    async def resolve_moved_issue(
+        self,
+        source_project_id: int,
+        iid: int,
+        expected_target_project_id: int,
+    ) -> GitLabIssueInfo | None:
+        """Resolve a completed move without retrying its non-idempotent POST."""
+        self._project_path(expected_target_project_id)
+        source_issue = await self.get_issue(source_project_id, iid)
+        if source_issue.moved_to_id is None:
+            return None
+        data = await self.request("GET", f"issues/{source_issue.moved_to_id}")
+        if not isinstance(data, Mapping):
+            raise ValueError("GitLab moved issue response must be an object")
+        returned_project_id = data.get("project_id")
+        if not _project_id(returned_project_id):
+            raise ValueError("GitLab moved issue response has an invalid project_id")
+        if returned_project_id != expected_target_project_id:
+            raise ValueError("GitLab moved issue response did not match expected target project")
+        return _issue_from_payload(returned_project_id, data)
 
     async def create_merge_request(
         self,
@@ -309,6 +345,8 @@ def _issue_from_payload(project_id: int, data: Mapping[str, Any]) -> GitLabIssue
         author=str(author.get("username") or "") if isinstance(author, Mapping) else "",
         labels=tuple(str(label) for label in (data.get("labels") or [])),
         web_url=str(data.get("web_url") or ""),
+        id=0 if data.get("id") is None else _iid(data["id"]),
+        moved_to_id=None if data.get("moved_to_id") is None else _iid(data["moved_to_id"]),
     )
 
 

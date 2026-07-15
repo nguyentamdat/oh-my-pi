@@ -142,8 +142,9 @@ class GitLabProxyClient:
                 await asyncio.sleep(delay)
         raise last_error  # type: ignore[misc]
 
-    async def get_authenticated_user(self) -> GitLabUserInfo:
-        return _user_from(await self._request("GET", "/gl/v1/authenticated_user"))
+    async def get_authenticated_user(self, project_id: int | None = None) -> GitLabUserInfo:
+        params = {"project_id": _project_id(project_id)} if project_id is not None else None
+        return _user_from(await self._request("GET", "/gl/v1/authenticated_user", params=params))
 
     async def get_project(self, project_id: int) -> GitLabProjectInfo:
         project_id = _project_id(project_id)
@@ -248,6 +249,34 @@ class GitLabProxyClient:
                 json_body={},
             )
         )
+
+    async def move_issue(self, project_id: int, iid: int, to_project_id: int) -> GitLabIssueInfo:
+        project_id = _project_id(project_id)
+        iid = _iid(iid)
+        to_project_id = _project_id(to_project_id)
+        return _issue_from(
+            await self._request(
+                "POST",
+                f"/gl/v1/projects/{project_id}/issues/{iid}/move",
+                json_body={"to_project_id": to_project_id},
+            )
+        )
+
+    async def resolve_moved_issue(
+        self,
+        source_project_id: int,
+        iid: int,
+        expected_target_project_id: int,
+    ) -> GitLabIssueInfo | None:
+        source_project_id = _project_id(source_project_id)
+        iid = _iid(iid)
+        expected_target_project_id = _project_id(expected_target_project_id)
+        data = await self._request(
+            "POST",
+            f"/gl/v1/projects/{source_project_id}/issues/{iid}/resolve_moved",
+            json_body={"expected_target_project_id": expected_target_project_id},
+        )
+        return None if data is None else _issue_from(data)
 
     async def create_merge_request(
         self,
@@ -419,6 +448,8 @@ def _issue_from(data: Any) -> GitLabIssueInfo:
         author=str(data.get("author") or ""),
         labels=tuple(str(label) for label in (data.get("labels") or [])),
         web_url=str(data.get("web_url") or ""),
+        id=int(data.get("id") or 0),
+        moved_to_id=int(data["moved_to_id"]) if data.get("moved_to_id") is not None else None,
     )
 
 

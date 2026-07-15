@@ -11,6 +11,7 @@ from robomp.forge import ForgeEvent, ForgeInstance
 from robomp.gitlab_events import GitLabWebhookAdapter
 
 PROJECT_ID = 356
+INTAKE_PROJECT_ID = 2080
 
 
 def _adapter(token: str) -> GitLabWebhookAdapter:
@@ -25,6 +26,23 @@ def _adapter(token: str) -> GitLabWebhookAdapter:
         allowed_project_ids=frozenset({PROJECT_ID}),
         bot_username="robomp",
         trigger_label="roboomp",
+    )
+
+
+def _intake_adapter(token: str, *, bot_usernames: frozenset[str] = frozenset()) -> GitLabWebhookAdapter:
+    return GitLabWebhookAdapter(
+        ForgeInstance(
+            id="zingplay",
+            kind="gitlab",
+            base_url="https://gitlab.zingplay.com",
+            api_url="https://gitlab.zingplay.com/api/v4",
+        ),
+        webhook_token=token,
+        allowed_project_ids=frozenset({PROJECT_ID, INTAKE_PROJECT_ID}),
+        bot_username="robomp",
+        bot_usernames=bot_usernames,
+        trigger_label="roboomp",
+        intake_project_id=INTAKE_PROJECT_ID,
     )
 
 
@@ -102,6 +120,27 @@ def test_normalize_ignores_unlabeled_issue_open() -> None:
     assert _adapter(secrets.token_urlsafe()).normalize(delivery_id="d0", headers={}, payload=payload) is None
 
 
+def test_normalize_unlabeled_intake_issue_for_routing() -> None:
+    payload = _issue_payload()
+    payload["project"] = {"id": INTAKE_PROJECT_ID, "path_with_namespace": "ica/triage"}
+    payload["labels"] = [{"title": "bug"}]
+
+    event = _intake_adapter(secrets.token_urlsafe()).normalize(delivery_id="route-open", headers={}, payload=payload)
+
+    assert event is not None
+    assert (event.task_kind, event.item.key) == ("route_issue", "zingplay:2080:issue:42")
+
+
+def test_normalize_intake_issue_update_for_rerouting() -> None:
+    payload = _issue_payload("update")
+    payload["project"] = {"id": INTAKE_PROJECT_ID, "path_with_namespace": "ica/triage"}
+
+    event = _intake_adapter(secrets.token_urlsafe()).normalize(delivery_id="route-update", headers={}, payload=payload)
+
+    assert event is not None
+    assert event.task_kind == "route_issue"
+
+
 def test_normalize_label_added_update_once() -> None:
     payload = _issue_payload("update")
     payload["changes"] = {
@@ -143,6 +182,16 @@ def test_normalize_issue_note() -> None:
     assert event.comment is not None and event.comment.body == "Please fix"
 
 
+def test_normalize_intake_issue_note_for_rerouting() -> None:
+    payload = _note_payload("Issue")
+    payload["project"] = {"id": INTAKE_PROJECT_ID, "path_with_namespace": "ica/triage"}
+
+    event = _intake_adapter(secrets.token_urlsafe()).normalize(delivery_id="route-note", headers={}, payload=payload)
+
+    assert event is not None
+    assert event.task_kind == "route_issue"
+
+
 @pytest.mark.parametrize(
     ("system", "internal", "body"),
     [(True, False, "changed label"), (False, True, "secret"), (False, False, "  ")],
@@ -181,3 +230,16 @@ def test_normalize_ignores_bot_event() -> None:
     payload = _issue_payload()
     payload["user"] = {"id": 9, "username": "robomp"}
     assert _adapter(secrets.token_urlsafe()).normalize(delivery_id="d6", headers={}, payload=payload) is None
+
+
+def test_normalize_ignores_any_configured_project_bot_login() -> None:
+    payload = _issue_payload()
+    payload["user"] = {"id": 12, "username": "project_357_bot_deadbeef"}
+
+    assert (
+        _intake_adapter(
+            secrets.token_urlsafe(),
+            bot_usernames=frozenset({"project_357_bot_deadbeef", "project_358_bot_deadbeef"}),
+        ).normalize(delivery_id="project-bot", headers={}, payload=payload)
+        is None
+    )

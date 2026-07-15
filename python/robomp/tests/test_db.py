@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
-from robomp.db import Database, iso_seconds_ago, issue_key
+import pytest
+
+from robomp.db import Database, RoutingLineageRow, canonical_item_key, iso_seconds_ago, issue_key
 
 
 def test_record_event_dedupes_by_delivery(db: Database) -> None:
@@ -23,6 +27,281 @@ def test_record_event_dedupes_by_delivery(db: Database) -> None:
         issue_key=issue_key("octo/widget", 1),
         payload=payload,
     )
+
+
+def _record_routing_lineage_event(
+    db: Database,
+    *,
+    source_canonical_key: str,
+    target_delivery_id: str = "routed-target-delivery",
+    target_item_number: int = 19,
+    target_payload: Mapping[str, Any] | None = None,
+) -> RoutingLineageRow:
+    payload: Mapping[str, Any] = {"object_kind": "issue", "object_attributes": {"iid": target_item_number}}
+    if target_payload is not None:
+        payload = target_payload
+    return db.record_routing_lineage_event(
+        source_canonical_key=source_canonical_key,
+        target_delivery_id=target_delivery_id,
+        target_event_type="Issue Hook",
+        target_canonical_event="issue.opened",
+        target_task_kind="triage_issue",
+        target_repo="ica/target",
+        target_repository_id="202",
+        target_item_kind="issue",
+        target_item_number=target_item_number,
+        target_issue_key="gitlab-target:202:issue:19",
+        target_payload=payload,
+        target_instance_id="gitlab-target",
+    )
+
+
+def test_routing_lineage_and_synthetic_event_are_atomic_and_canonical(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+
+    with pytest.raises(TypeError):
+        _record_routing_lineage_event(
+            db,
+            source_canonical_key=source,
+            target_payload={"unserializable": object()},
+        )
+    assert db.resolve_routing_lineage(source) is None
+    assert db.get_event("routed-target-delivery", instance_id="gitlab-target") is None
+
+    lineage = _record_routing_lineage_event(db, source_canonical_key=source)
+    assert lineage.source_canonical_key == source
+    assert lineage.target_canonical_key == target
+    assert db.resolve_routing_lineage(source) == lineage
+    assert db.is_routed_target(target)
+
+    event = db.get_event("routed-target-delivery", instance_id="gitlab-target")
+    assert event is not None
+    assert event.state == "queued"
+    assert event.canonical_key == target
+    assert event.instance_id == "gitlab-target"
+    assert event.repository_id == "202"
+    assert event.item_kind == "issue"
+    assert event.item_number == 19
+    assert event.canonical_event == "issue.opened"
+    assert event.task_kind == "triage_issue"
+
+
+def test_routing_lineage_retry_is_a_no_op_and_conflicts_are_rejected(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+    first = _record_routing_lineage_event(db, source_canonical_key=source)
+    retry = _record_routing_lineage_event(
+        db,
+        source_canonical_key=source,
+        target_delivery_id="routed-target-delivery",
+    )
+    assert retry == first
+    assert [event.delivery_id for event in db.list_events()] == ["routed-target-delivery"]
+    db.remove_event("routed-target-delivery", instance_id="gitlab-target")
+    repaired = _record_routing_lineage_event(db, source_canonical_key=source)
+    assert repaired == first
+    assert [event.delivery_id for event in db.list_events()] == ["routed-target-delivery"]
+
+    with pytest.raises(ValueError, match="routing lineage conflict"):
+        _record_routing_lineage_event(
+            db,
+            source_canonical_key=source,
+            target_delivery_id="conflicting-target",
+            target_item_number=20,
+        )
+    lineage = db.resolve_routing_lineage(source)
+    assert lineage is not None and lineage.target_canonical_key == target
+    assert db.get_event("conflicting-target", instance_id="gitlab-target") is None
+
+
+def test_routing_target_comment_does_not_suppress_synthetic_event(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+    assert db.record_event(
+        instance_id="gitlab-target",
+        delivery_id="target-arrived-first",
+        event_type="Note Hook",
+        canonical_event="note.created",
+        task_kind="handle_comment",
+        repo="ica/target",
+        repository_id="202",
+        item_kind="issue",
+        item_number=19,
+        issue_key="gitlab-target:202:issue:19",
+        payload={"object_kind": "note"},
+    )
+
+    _record_routing_lineage_event(
+        db,
+        source_canonical_key=source,
+        target_delivery_id="synthetic-target-delivery",
+    )
+    assert db.is_routed_target(target)
+    assert {event.delivery_id for event in db.list_events()} == {
+        "synthetic-target-delivery",
+        "target-arrived-first",
+    }
+    synthetic = db.get_event("synthetic-target-delivery", instance_id="gitlab-target")
+    assert synthetic is not None and synthetic.state == "queued"
+    assert synthetic.task_kind == "triage_issue"
+    assert not db.record_event(
+        instance_id="gitlab-target",
+        delivery_id="target-arrived-first",
+        event_type="Issue Hook",
+        repo="ica/target",
+        issue_key="gitlab-target:202:issue:19",
+        payload={"object_kind": "issue"},
+    )
+
+
+def test_routing_intent_survives_pre_completion_crash_and_retry(tmp_path: Path) -> None:
+    path = tmp_path / "routing.sqlite"
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+    before_move = Database(path)
+    intent = before_move.begin_routing_intent(source, 202)
+    assert intent.target_canonical_key is None
+    before_move.close()
+
+    after_move = Database(path)
+    try:
+        pending = after_move.get_incomplete_routing_intent(source)
+        assert pending == intent
+        assert after_move.resolve_routing_lineage(source) is None
+
+        with pytest.raises(TypeError):
+            after_move.complete_routing_intent_event(
+                source_canonical_key=source,
+                target_delivery_id="intent-synthetic-delivery",
+                target_event_type="Issue Hook",
+                target_canonical_event="issue.opened",
+                target_task_kind="triage_issue",
+                target_repo="ica/target",
+                target_repository_id="202",
+                target_item_kind="issue",
+                target_item_number=19,
+                target_issue_key=target,
+                target_payload={"unserializable": object()},
+                target_instance_id="gitlab-target",
+            )
+        assert after_move.get_incomplete_routing_intent(source) == intent
+        assert after_move.resolve_routing_lineage(source) is None
+
+        lineage = after_move.complete_routing_intent_event(
+            source_canonical_key=source,
+            target_delivery_id="intent-synthetic-delivery",
+            target_event_type="Issue Hook",
+            target_canonical_event="issue.opened",
+            target_task_kind="triage_issue",
+            target_repo="ica/target",
+            target_repository_id="202",
+            target_item_kind="issue",
+            target_item_number=19,
+            target_issue_key=target,
+            target_payload={"object_kind": "issue"},
+            target_instance_id="gitlab-target",
+        )
+        assert lineage.target_canonical_key == target
+        assert after_move.get_incomplete_routing_intent(source) is None
+        completed = after_move.begin_routing_intent(source, "202")
+        assert completed.target_canonical_key == target
+        assert completed.completed_at is not None
+        after_move.remove_event("intent-synthetic-delivery", instance_id="gitlab-target")
+
+        retry = after_move.complete_routing_intent_event(
+            source_canonical_key=source,
+            target_delivery_id="intent-synthetic-delivery",
+            target_event_type="Issue Hook",
+            target_canonical_event="issue.opened",
+            target_task_kind="triage_issue",
+            target_repo="ica/target",
+            target_repository_id="202",
+            target_item_kind="issue",
+            target_item_number=19,
+            target_issue_key=target,
+            target_payload={"object_kind": "issue"},
+            target_instance_id="gitlab-target",
+        )
+        assert retry == lineage
+        assert [event.delivery_id for event in after_move.list_events()] == ["intent-synthetic-delivery"]
+        with pytest.raises(ValueError, match="routing intent conflict"):
+            after_move.begin_routing_intent(source, 303)
+    finally:
+        after_move.close()
+
+
+def test_routing_decisions_retain_recommendation_and_later_explicit_route(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    candidates = [
+        {"project_id": 202, "key": "target", "score": 8, "confidence": 0.9},
+        {"project_id": 303, "key": "other", "score": 4, "confidence": 0.6},
+    ]
+    recommendation = db.record_routing_decision(
+        instance_id="gitlab-source",
+        delivery_id="recommendation-delivery",
+        source_canonical_key=source,
+        ranked_candidates=candidates,
+        selected_target_key=None,
+        selected_project_id=None,
+        explicit=False,
+        action="recommend",
+        mode="recommend",
+    )
+    human_route = db.record_routing_decision(
+        instance_id="gitlab-source",
+        delivery_id="human-route-delivery",
+        source_canonical_key=source,
+        ranked_candidates=candidates,
+        selected_target_key="target",
+        selected_project_id=202,
+        explicit=True,
+        action="route",
+        mode="auto_move",
+    )
+    repeat_recommendation = db.record_routing_decision(
+        instance_id="gitlab-source",
+        delivery_id="recommendation-delivery",
+        source_canonical_key=source,
+        ranked_candidates=candidates,
+        selected_target_key=None,
+        selected_project_id=None,
+        explicit=False,
+        action="recommend",
+        mode="recommend",
+    )
+
+    assert repeat_recommendation == recommendation
+    decisions = db.list_routing_decisions(source)
+    assert [decision.delivery_id for decision in decisions] == [
+        "recommendation-delivery",
+        "human-route-delivery",
+    ]
+    assert decisions[0].candidates == candidates
+    assert decisions[0].selected_target_key is None
+    assert not decisions[0].explicit
+    assert human_route.selected_target_key == "target"
+    assert human_route.selected_project_id == "202"
+    assert human_route.explicit
+
+
+def test_routing_lineage_schema_is_safe_to_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "routing.sqlite"
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+    first = Database(path)
+    _record_routing_lineage_event(first, source_canonical_key=source)
+    first.close()
+
+    reopened = Database(path)
+    try:
+        lineage = reopened.resolve_routing_lineage(source)
+        assert lineage is not None
+        assert lineage.target_canonical_key == target
+        assert reopened.is_routed_target(target)
+        assert reopened.get_event("routed-target-delivery", instance_id="gitlab-target") is not None
+    finally:
+        reopened.close()
 
 
 def test_event_identity_allows_same_delivery_and_local_number_across_instances(db: Database) -> None:

@@ -66,6 +66,41 @@ CREATE INDEX IF NOT EXISTS events_state_received
 CREATE INDEX IF NOT EXISTS events_issue_state
   ON events(issue_key, state);
 
+
+CREATE TABLE IF NOT EXISTS routing_lineage (
+  source_canonical_key TEXT PRIMARY KEY,
+  target_canonical_key TEXT NOT NULL,
+  created_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routing_lineage_target_canonical_key
+  ON routing_lineage(target_canonical_key);
+
+CREATE TABLE IF NOT EXISTS routing_intents (
+  source_canonical_key TEXT PRIMARY KEY,
+  target_project_id   TEXT NOT NULL,
+  target_canonical_key TEXT,
+  created_at           TEXT NOT NULL,
+  completed_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS routing_intents_incomplete
+  ON routing_intents(created_at)
+  WHERE target_canonical_key IS NULL;
+
+CREATE TABLE IF NOT EXISTS routing_decisions (
+  instance_id          TEXT NOT NULL,
+  delivery_id          TEXT NOT NULL,
+  source_canonical_key TEXT NOT NULL,
+  candidates_json      TEXT NOT NULL,
+  selected_target_key  TEXT,
+  selected_project_id  TEXT,
+  explicit             INTEGER NOT NULL CHECK (explicit IN (0, 1)),
+  action               TEXT NOT NULL,
+  mode                 TEXT NOT NULL,
+  created_at           TEXT NOT NULL,
+  PRIMARY KEY (instance_id, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS routing_decisions_source_created
+  ON routing_decisions(source_canonical_key, created_at);
 CREATE TABLE IF NOT EXISTS issues (
   key            TEXT PRIMARY KEY,
   repo           TEXT NOT NULL,
@@ -171,6 +206,42 @@ class EventRow:
         if self.instance_id == DEFAULT_GITHUB_INSTANCE:
             return self.delivery_id
         return f"{self.instance_id}:{self.delivery_id}"
+
+
+@dataclass(slots=True, frozen=True)
+class RoutingLineageRow:
+    """A durable canonical identity transition created by routing."""
+
+    source_canonical_key: str
+    target_canonical_key: str
+    created_at: str
+
+
+@dataclass(slots=True, frozen=True)
+class RoutingIntentRow:
+    """A durable pre-move routing intent, optionally completed after the move."""
+
+    source_canonical_key: str
+    target_project_id: str
+    target_canonical_key: str | None
+    created_at: str
+    completed_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class RoutingDecisionRow:
+    """One auditable routing recommendation or explicit route decision."""
+
+    instance_id: str
+    delivery_id: str
+    source_canonical_key: str
+    candidates: list[dict[str, Any]]
+    selected_target_key: str | None
+    selected_project_id: str | None
+    explicit: bool
+    action: str
+    mode: str
+    created_at: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -881,6 +952,431 @@ class Database:
                 (canonical_key,),
             ).fetchone()
         return row is not None
+
+    def resolve_routing_lineage(self, source_canonical_key: str) -> RoutingLineageRow | None:
+        """Resolve the target identity previously assigned to a source identity."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT source_canonical_key, target_canonical_key, created_at
+                FROM routing_lineage
+                WHERE source_canonical_key=?
+                """,
+                (source_canonical_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RoutingLineageRow(
+            source_canonical_key=row["source_canonical_key"],
+            target_canonical_key=row["target_canonical_key"],
+            created_at=row["created_at"],
+        )
+
+    def resolve_routed_target(self, target_canonical_key: str) -> RoutingLineageRow | None:
+        """Return one lineage that produced this target identity, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT source_canonical_key, target_canonical_key, created_at
+                FROM routing_lineage
+                WHERE target_canonical_key=?
+                ORDER BY created_at, source_canonical_key
+                LIMIT 1
+                """,
+                (target_canonical_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RoutingLineageRow(
+            source_canonical_key=row["source_canonical_key"],
+            target_canonical_key=row["target_canonical_key"],
+            created_at=row["created_at"],
+        )
+
+    def is_routed_target(self, target_canonical_key: str) -> bool:
+        """Whether ingress/dispatch should treat a canonical target as routed."""
+        return self.resolve_routed_target(target_canonical_key) is not None
+
+    def _persist_routing_lineage_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source_canonical_key: str,
+        target_canonical_key: str,
+        target_delivery_id: str,
+        target_event_type: str,
+        target_repo: str | None,
+        target_issue_key: str | None,
+        target_payload: Mapping[str, Any],
+        target_repository_id: str,
+        target_item_kind: str,
+        target_item_number: int,
+        target_canonical_event: str | None,
+        target_task_kind: str | None,
+        target_instance_id: str,
+        now: str,
+    ) -> RoutingLineageRow:
+        existing = conn.execute(
+            """
+            SELECT source_canonical_key, target_canonical_key, created_at
+            FROM routing_lineage
+            WHERE source_canonical_key=?
+            """,
+            (source_canonical_key,),
+        ).fetchone()
+        if existing is not None:
+            if existing["target_canonical_key"] != target_canonical_key:
+                raise ValueError("routing lineage conflict: source canonical key already has a different target")
+            lineage = RoutingLineageRow(
+                source_canonical_key=existing["source_canonical_key"],
+                target_canonical_key=existing["target_canonical_key"],
+                created_at=existing["created_at"],
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO routing_lineage (
+                  source_canonical_key, target_canonical_key, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (source_canonical_key, target_canonical_key, now),
+            )
+            lineage = RoutingLineageRow(
+                source_canonical_key=source_canonical_key,
+                target_canonical_key=target_canonical_key,
+                created_at=now,
+            )
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO events (
+              instance_id, delivery_id, event_type, canonical_event, task_kind,
+              repo, repository_id, item_kind, item_number, canonical_key, issue_key,
+              payload_json, received_at, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+            """,
+            (
+                target_instance_id,
+                target_delivery_id,
+                target_event_type,
+                target_canonical_event,
+                target_task_kind,
+                target_repo,
+                target_repository_id,
+                target_item_kind,
+                target_item_number,
+                target_canonical_key,
+                target_issue_key,
+                json.dumps(target_payload, separators=(",", ":")),
+                now,
+            ),
+        )
+        return lineage
+
+    def record_routing_lineage_event(
+        self,
+        *,
+        source_canonical_key: str,
+        target_delivery_id: str,
+        target_event_type: str,
+        target_repo: str | None,
+        target_issue_key: str | None,
+        target_payload: Mapping[str, Any],
+        target_repository_id: str,
+        target_item_kind: str,
+        target_item_number: int,
+        target_canonical_event: str | None = None,
+        target_task_kind: str | None = None,
+        target_instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> RoutingLineageRow:
+        """Atomically persist a route and its exact synthetic queued event."""
+        if not source_canonical_key:
+            raise ValueError("source_canonical_key is required")
+        if not target_instance_id or not target_repository_id or not target_item_kind:
+            raise ValueError("target canonical identity fields are required")
+        if isinstance(target_item_number, bool) or not isinstance(target_item_number, int):
+            raise ValueError("target_item_number must be an integer")
+        target_canonical_key = canonical_item_key(
+            target_instance_id,
+            target_repository_id,
+            target_item_kind,
+            target_item_number,
+        )
+        with self._txn() as conn:
+            return self._persist_routing_lineage_event(
+                conn,
+                source_canonical_key=source_canonical_key,
+                target_canonical_key=target_canonical_key,
+                target_delivery_id=target_delivery_id,
+                target_event_type=target_event_type,
+                target_repo=target_repo,
+                target_issue_key=target_issue_key,
+                target_payload=target_payload,
+                target_repository_id=target_repository_id,
+                target_item_kind=target_item_kind,
+                target_item_number=target_item_number,
+                target_canonical_event=target_canonical_event,
+                target_task_kind=target_task_kind,
+                target_instance_id=target_instance_id,
+                now=_utcnow(),
+            )
+
+    def begin_routing_intent(
+        self,
+        source_canonical_key: str,
+        target_project_id: str | int,
+    ) -> RoutingIntentRow:
+        """Durably record a planned target project before performing a move."""
+        if not source_canonical_key:
+            raise ValueError("source_canonical_key is required")
+        if isinstance(target_project_id, bool):
+            raise ValueError("target_project_id must be a string or integer")
+        normalized_target_project_id = str(target_project_id)
+        if not normalized_target_project_id:
+            raise ValueError("target_project_id is required")
+        now = _utcnow()
+        with self._txn() as conn:
+            existing = conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, target_canonical_key, created_at, completed_at
+                FROM routing_intents
+                WHERE source_canonical_key=?
+                """,
+                (source_canonical_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["target_project_id"] != normalized_target_project_id:
+                    raise ValueError("routing intent conflict: source canonical key already has a different target")
+                return RoutingIntentRow(
+                    source_canonical_key=existing["source_canonical_key"],
+                    target_project_id=existing["target_project_id"],
+                    target_canonical_key=existing["target_canonical_key"],
+                    created_at=existing["created_at"],
+                    completed_at=existing["completed_at"],
+                )
+            conn.execute(
+                """
+                INSERT INTO routing_intents (
+                  source_canonical_key, target_project_id, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (source_canonical_key, normalized_target_project_id, now),
+            )
+        return RoutingIntentRow(
+            source_canonical_key=source_canonical_key,
+            target_project_id=normalized_target_project_id,
+            target_canonical_key=None,
+            created_at=now,
+            completed_at=None,
+        )
+
+    def get_incomplete_routing_intent(self, source_canonical_key: str) -> RoutingIntentRow | None:
+        """Return the pre-move intent that still needs post-move completion."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, target_canonical_key, created_at, completed_at
+                FROM routing_intents
+                WHERE source_canonical_key=? AND target_canonical_key IS NULL
+                """,
+                (source_canonical_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RoutingIntentRow(
+            source_canonical_key=row["source_canonical_key"],
+            target_project_id=row["target_project_id"],
+            target_canonical_key=row["target_canonical_key"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    def complete_routing_intent_event(
+        self,
+        *,
+        source_canonical_key: str,
+        target_delivery_id: str,
+        target_event_type: str,
+        target_repo: str | None,
+        target_issue_key: str | None,
+        target_payload: Mapping[str, Any],
+        target_repository_id: str,
+        target_item_kind: str,
+        target_item_number: int,
+        target_canonical_event: str | None = None,
+        target_task_kind: str | None = None,
+        target_instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> RoutingLineageRow:
+        """Complete a pre-move intent with the moved target and queued event."""
+        if not source_canonical_key:
+            raise ValueError("source_canonical_key is required")
+        if not target_instance_id or not target_repository_id or not target_item_kind:
+            raise ValueError("target canonical identity fields are required")
+        if isinstance(target_item_number, bool) or not isinstance(target_item_number, int):
+            raise ValueError("target_item_number must be an integer")
+        target_canonical_key = canonical_item_key(
+            target_instance_id,
+            target_repository_id,
+            target_item_kind,
+            target_item_number,
+        )
+        now = _utcnow()
+        with self._txn() as conn:
+            intent = conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, target_canonical_key, created_at, completed_at
+                FROM routing_intents
+                WHERE source_canonical_key=?
+                """,
+                (source_canonical_key,),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("routing intent not found")
+            if intent["target_project_id"] != target_repository_id:
+                raise ValueError("routing intent conflict: completed target project differs from planned target")
+            if intent["target_canonical_key"] is not None:
+                if intent["target_canonical_key"] != target_canonical_key:
+                    raise ValueError("routing intent conflict: source canonical key already has a different target")
+            else:
+                conn.execute(
+                    """
+                    UPDATE routing_intents
+                    SET target_canonical_key=?, completed_at=?
+                    WHERE source_canonical_key=?
+                    """,
+                    (target_canonical_key, now, source_canonical_key),
+                )
+            return self._persist_routing_lineage_event(
+                conn,
+                source_canonical_key=source_canonical_key,
+                target_canonical_key=target_canonical_key,
+                target_delivery_id=target_delivery_id,
+                target_event_type=target_event_type,
+                target_repo=target_repo,
+                target_issue_key=target_issue_key,
+                target_payload=target_payload,
+                target_repository_id=target_repository_id,
+                target_item_kind=target_item_kind,
+                target_item_number=target_item_number,
+                target_canonical_event=target_canonical_event,
+                target_task_kind=target_task_kind,
+                target_instance_id=target_instance_id,
+                now=now,
+            )
+
+    def record_routing_decision(
+        self,
+        *,
+        instance_id: str,
+        delivery_id: str,
+        source_canonical_key: str,
+        ranked_candidates: Iterable[Mapping[str, Any]],
+        selected_target_key: str | None,
+        selected_project_id: str | int | None,
+        explicit: bool,
+        action: str,
+        mode: str,
+    ) -> RoutingDecisionRow:
+        """Persist one delivery's auditable routing outcome without routing imports."""
+        if not instance_id or not delivery_id or not source_canonical_key:
+            raise ValueError("routing decision identity fields are required")
+        if not action or not mode:
+            raise ValueError("routing decision action and mode are required")
+        if isinstance(explicit, bool) is False:
+            raise ValueError("explicit must be a boolean")
+        if isinstance(selected_project_id, bool):
+            raise ValueError("selected_project_id must be a string, integer, or None")
+        candidates_json = json.dumps([dict(candidate) for candidate in ranked_candidates], separators=(",", ":"))
+        normalized_project_id = None if selected_project_id is None else str(selected_project_id)
+        now = _utcnow()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO routing_decisions (
+                  instance_id, delivery_id, source_canonical_key, candidates_json,
+                  selected_target_key, selected_project_id, explicit, action, mode, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(instance_id, delivery_id) DO UPDATE SET
+                  source_canonical_key=excluded.source_canonical_key,
+                  candidates_json=excluded.candidates_json,
+                  selected_target_key=excluded.selected_target_key,
+                  selected_project_id=excluded.selected_project_id,
+                  explicit=excluded.explicit,
+                  action=excluded.action,
+                  mode=excluded.mode
+                """,
+                (
+                    instance_id,
+                    delivery_id,
+                    source_canonical_key,
+                    candidates_json,
+                    selected_target_key,
+                    normalized_project_id,
+                    int(explicit),
+                    action,
+                    mode,
+                    now,
+                ),
+            )
+            row = self._conn.execute(
+                """
+                SELECT instance_id, delivery_id, source_canonical_key, candidates_json,
+                       selected_target_key, selected_project_id, explicit, action, mode, created_at
+                FROM routing_decisions
+                WHERE instance_id=? AND delivery_id=?
+                """,
+                (instance_id, delivery_id),
+            ).fetchone()
+        assert row is not None
+        return RoutingDecisionRow(
+            instance_id=row["instance_id"],
+            delivery_id=row["delivery_id"],
+            source_canonical_key=row["source_canonical_key"],
+            candidates=json.loads(row["candidates_json"]),
+            selected_target_key=row["selected_target_key"],
+            selected_project_id=row["selected_project_id"],
+            explicit=bool(row["explicit"]),
+            action=row["action"],
+            mode=row["mode"],
+            created_at=row["created_at"],
+        )
+
+    def list_routing_decisions(
+        self,
+        source_canonical_key: str,
+        *,
+        limit: int = 50,
+    ) -> list[RoutingDecisionRow]:
+        """Return an ordered, bounded audit trail for one source identity."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT instance_id, delivery_id, source_canonical_key, candidates_json,
+                       selected_target_key, selected_project_id, explicit, action, mode, created_at
+                FROM routing_decisions
+                WHERE source_canonical_key=?
+                ORDER BY created_at, rowid
+                LIMIT ?
+                """,
+                (source_canonical_key, limit),
+            ).fetchall()
+        return [
+            RoutingDecisionRow(
+                instance_id=row["instance_id"],
+                delivery_id=row["delivery_id"],
+                source_canonical_key=row["source_canonical_key"],
+                candidates=json.loads(row["candidates_json"]),
+                selected_target_key=row["selected_target_key"],
+                selected_project_id=row["selected_project_id"],
+                explicit=bool(row["explicit"]),
+                action=row["action"],
+                mode=row["mode"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def has_authorized_impl_event(self, issue_key: str) -> bool:
         """Return whether a non-skipped event on this issue carried implementation authorization."""

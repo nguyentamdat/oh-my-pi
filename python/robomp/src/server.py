@@ -283,7 +283,12 @@ def _build_forge_runtime_factories(
             project_id=project_id,
             repository=row.repo or "",
         )
-        return ForgeRuntime(backend=backend, sandbox=sandbox, git_transport=transport)
+        return ForgeRuntime(
+            backend=backend,
+            sandbox=sandbox,
+            git_transport=transport,
+            routing_backend=client,
+        )
 
     return {cfg.gitlab_instance_id: gitlab_runtime}
 
@@ -307,7 +312,11 @@ def _build_webhook_adapters(
             webhook_token=settings.gitlab_webhook_secret.get_secret_value(),
             allowed_project_ids=settings.gitlab_project_ids,
             bot_username=settings.gitlab_bot_login,
+            bot_usernames=settings.gitlab_bot_logins,
             trigger_label=settings.gitlab_trigger_label,
+            intake_project_id=(
+                settings.gitlab_routing_policy.intake_project_id if settings.gitlab_routing_policy is not None else None
+            ),
         )
     if injected:
         adapters.update(injected)
@@ -669,6 +678,34 @@ def create_app(
                 return JSONResponse({"delivery": delivery_id, "state": "skipped"}, status_code=202)
 
         db: Database = bag["db"]
+        routed_target_event = db.latest_event_for_issue(event.item.key)
+        if (
+            event.task_kind == "triage_issue"
+            and db.is_routed_target(event.item.key)
+            and routed_target_event is not None
+            and routed_target_event.delivery_id.startswith("route:")
+            and routed_target_event.state in {"queued", "running"}
+        ):
+            db.record_event(
+                instance_id=instance_id,
+                delivery_id=event.delivery_id,
+                event_type=event.source_event,
+                canonical_event=event.event,
+                task_kind=event.task_kind,
+                repo=event.item.repository.full_name,
+                repository_id=event.item.repository.remote_id,
+                item_kind=event.item.kind,
+                item_number=event.item.number,
+                canonical_key=event.item.key,
+                issue_key=event.item.key,
+                payload=event.to_dict(),
+                state="skipped",
+                last_error="routed target is owned by the synthetic routing event",
+            )
+            return JSONResponse(
+                {"delivery": event.delivery_id, "instance": instance_id, "state": "skipped"},
+                status_code=202,
+            )
         if event.task_kind in {"handle_comment", "handle_pr_conversation"} and not db.has_activated_item(
             event.item.key
         ):

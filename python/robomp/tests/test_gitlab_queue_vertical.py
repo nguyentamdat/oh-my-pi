@@ -57,7 +57,8 @@ class _GitLabBackend:
         del project_id, iid
         return []
 
-    async def get_authenticated_user(self) -> GitLabUserInfo:
+    async def get_authenticated_user(self, project_id: int | None = None) -> GitLabUserInfo:
+        assert project_id == 356
         return GitLabUserInfo(id=99, username="roboomp", name="RoboOMP")
 
     async def list_issue_related_merge_requests(

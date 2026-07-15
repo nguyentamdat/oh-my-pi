@@ -10,12 +10,13 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 
-from robomp import tasks
+from robomp import routing_tasks, tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
 from robomp.forge import ForgeEvent
 from robomp.github_backend import GitHubBackend
+from robomp.gitlab_backend import GitLabBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 
@@ -27,6 +28,8 @@ class ForgeRuntime:
     backend: GitHubBackend
     sandbox: SandboxManager
     git_transport: GitTransport
+
+    routing_backend: GitLabBackend | None = None
 
 
 class WorkerPool:
@@ -378,6 +381,25 @@ class WorkerPool:
         event = ForgeEvent.from_dict(row.payload)
         if event.item.key != row.canonical_key or event.delivery_id != row.delivery_id:
             raise RuntimeError("persisted forge event identity mismatch")
+        if event.event == "issue.routed":
+            if runtime.routing_backend is None:
+                raise RuntimeError("GitLab routing backend is not configured")
+            await routing_tasks.apply_target_routing(event, runtime.routing_backend)
+        if event.task_kind == "route_issue":
+            policy = self.settings.gitlab_routing_policy
+            if policy is None or runtime.routing_backend is None:
+                raise RuntimeError("GitLab routing is not configured")
+            outcome = await routing_tasks.route_issue(
+                event=event,
+                policy=policy,
+                db=self.db,
+                gitlab=runtime.routing_backend,
+            )
+            if outcome.target_event_queued:
+                self.wake()
+            return
+        if event.task_kind == "routing_complete":
+            return
         if event.task_kind == "triage_issue":
             await tasks.triage_issue(
                 settings=self.settings,

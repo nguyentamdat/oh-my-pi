@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from robomp.gitlab_client import GitLabMergeRequestInfo
+from robomp.gitlab_client import GitLabMergeRequestInfo, GitLabNoteInfo, GitLabUserInfo
 from robomp.gitlab_compat import GitLabIssueBackend
 
 
@@ -103,6 +103,33 @@ class _AmbiguousCreateBackend:
         raise TimeoutError("response lost")
 
 
+class _ProjectScopedIdentityBackend:
+    def __init__(self) -> None:
+        self.identity_project_ids: list[int | None] = []
+        self.post_calls = 0
+
+    async def get_authenticated_user(self, project_id: int | None = None) -> GitLabUserInfo:
+        self.identity_project_ids.append(project_id)
+        return GitLabUserInfo(id=1, username="robomp", name="RoboMP")
+
+    async def list_issue_notes(self, project_id: int, iid: int) -> list[GitLabNoteInfo]:
+        assert (project_id, iid) == (356, 42)
+        return [
+            GitLabNoteInfo(
+                id=100,
+                author="robomp",
+                body="Already posted",
+                created_at="2026-01-01T00:00:00Z",
+                system=False,
+                internal=False,
+            )
+        ]
+
+    async def post_issue_note(self, *_args, **_kwargs) -> GitLabNoteInfo:
+        self.post_calls += 1
+        raise AssertionError("duplicate note should not be posted")
+
+
 @pytest.mark.asyncio
 async def test_closing_pull_requests_excludes_reference_only_related_merge_requests() -> None:
     backend = GitLabIssueBackend(
@@ -112,6 +139,22 @@ async def test_closing_pull_requests_excludes_reference_only_related_merge_reque
     )
 
     assert await backend.list_closing_pull_requests("ica/server", 42) == (10,)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_comment_retry_uses_project_scoped_identity() -> None:
+    native = _ProjectScopedIdentityBackend()
+    backend = GitLabIssueBackend(
+        native,  # type: ignore[arg-type]
+        project_id=356,
+        repository="ica/server",
+    )
+
+    comment = await backend.post_comment("ica/server", 42, "Already posted")
+
+    assert comment.id == 100
+    assert native.identity_project_ids == [356]
+    assert native.post_calls == 0
 
 
 @pytest.mark.asyncio

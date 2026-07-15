@@ -39,8 +39,8 @@ def serve() -> None:
     cfg.ensure_paths()
     # `load_proxy_settings` already rejects blank values, but stay defensive
     # in case a caller constructs the Settings by hand.
-    if cfg.github_token is None and cfg.gitlab_token is None:
-        click.echo("forge proxy: GITHUB_TOKEN or ROBOMP_GITLAB_TOKEN is required", err=True)
+    if cfg.github_token is None and not cfg.gitlab_proxy_enabled:
+        click.echo("forge proxy: GitHub or GitLab proxy credentials are required", err=True)
         sys.exit(2)
     if cfg.gh_proxy_hmac_key is None:
         click.echo("gh-proxy: ROBOMP_GH_PROXY_HMAC_KEY is required in proxy mode", err=True)

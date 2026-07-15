@@ -21,6 +21,8 @@ class GitLabWebhookAdapter:
         allowed_project_ids: frozenset[int],
         bot_username: str,
         trigger_label: str,
+        intake_project_id: int | None = None,
+        bot_usernames: frozenset[str] = frozenset(),
     ) -> None:
         if instance.kind != "gitlab":
             raise ValueError("GitLab adapter requires a GitLab instance")
@@ -28,6 +30,10 @@ class GitLabWebhookAdapter:
         self._webhook_token = webhook_token
         self._allowed_project_ids = allowed_project_ids
         self._bot_username = bot_username
+        self._intake_project_id = intake_project_id
+        self._bot_usernames = frozenset(
+            {bot_username.casefold(), *(login.casefold() for login in bot_usernames if login)}
+        )
         self._trigger_label = trigger_label.casefold()
 
     def verify(self, headers: Mapping[str, str], raw_body: bytes) -> str:
@@ -58,7 +64,7 @@ class GitLabWebhookAdapter:
 
         actor_data = _mapping(payload.get("user"))
         actor = _actor(actor_data)
-        if _is_bot(actor_data, actor.login, self._bot_username):
+        if _is_bot(actor_data, actor.login, self._bot_usernames):
             return None
 
         attributes = _mapping(payload.get("object_attributes"))
@@ -71,6 +77,7 @@ class GitLabWebhookAdapter:
             full_name=_string(project.get("path_with_namespace")),
         )
         object_kind = str(payload.get("object_kind") or payload.get("event_type") or "").lower()
+        is_intake = project_id == self._intake_project_id
         if object_kind == "issue":
             return _normalize_issue(
                 delivery_id,
@@ -80,9 +87,10 @@ class GitLabWebhookAdapter:
                 repository,
                 actor,
                 self._trigger_label,
+                is_intake,
             )
         if object_kind == "note":
-            return _normalize_note(delivery_id, source_event, payload, attributes, repository, actor)
+            return _normalize_note(delivery_id, source_event, payload, attributes, repository, actor, is_intake)
         return None
 
 
@@ -99,6 +107,7 @@ def _normalize_issue(
     repository: RepositoryRef,
     actor: Actor,
     trigger_label: str,
+    is_intake: bool,
 ) -> ForgeEvent | None:
     iid = attributes.get("iid")
     if not _positive_int(iid):
@@ -106,7 +115,13 @@ def _normalize_issue(
     action = str(attributes.get("action") or "").lower()
     labels = _labels(payload.get("labels") or attributes.get("labels"))
     current_labels = {label.casefold() for label in labels}
-    if action == "open" and trigger_label in current_labels:
+    if is_intake and action == "open":
+        event, task = "issue.opened", "route_issue"
+    elif is_intake and action == "update":
+        event, task = "issue.updated", "route_issue"
+    elif is_intake and action == "reopen":
+        event, task = "issue.reopened", "route_issue"
+    elif action == "open" and trigger_label in current_labels:
         event, task = "issue.opened", "triage_issue"
     elif action == "update" and _label_added(payload, trigger_label):
         event, task = "issue.updated", "triage_issue"
@@ -137,6 +152,7 @@ def _normalize_note(
     attributes: Mapping[str, Any],
     repository: RepositoryRef,
     actor: Actor,
+    is_intake: bool,
 ) -> ForgeEvent | None:
     if str(attributes.get("action") or "").lower() != "create":
         return None
@@ -149,7 +165,7 @@ def _normalize_note(
             _mapping(payload.get("issue")),
             "issue",
             "issue.comment.created",
-            "handle_comment",
+            "route_issue" if is_intake else "handle_comment",
         )
     elif noteable_type == "mergerequest":
         return None
@@ -216,12 +232,12 @@ def _actor(user: Mapping[str, Any]) -> Actor:
     return Actor(remote_id=str(user.get("id") or ""), login=_string(user.get("username")))
 
 
-def _is_bot(user: Mapping[str, Any], login: str, bot_username: str) -> bool:
+def _is_bot(user: Mapping[str, Any], login: str, bot_usernames: frozenset[str]) -> bool:
     return bool(
         user.get("bot")
         or str(user.get("user_type") or "").casefold() == "bot"
         or login.casefold().endswith("[bot]")
-        or (login and bot_username and login.casefold() == bot_username.casefold())
+        or (login and login.casefold() in bot_usernames)
     )
 
 

@@ -94,11 +94,11 @@ class GitLabIssueBackend:
         ]
 
     async def get_authenticated_login(self) -> str:
-        return (await self._call(self._backend.get_authenticated_user)).username
+        return (await self._call(lambda: self._backend.get_authenticated_user(self._project_id))).username
 
     async def post_comment(self, repo: str, number: int, body: str) -> CommentInfo:
         self._repo(repo)
-        user = await self._call(self._backend.get_authenticated_user)
+        user = await self._call(lambda: self._backend.get_authenticated_user(self._project_id))
         notes = await self._call(lambda: self._backend.list_issue_notes(self._project_id, number))
         for existing in reversed(notes):
             if (

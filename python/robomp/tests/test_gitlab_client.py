@@ -187,6 +187,101 @@ async def test_project_issue_note_and_write_routes_use_numeric_project_id() -> N
 
 
 @pytest.mark.asyncio
+async def test_move_issue_posts_target_project_and_returns_target_issue() -> None:
+    target_project_id = 357
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues/42/move"
+        assert json.loads(request.content) == {"to_project_id": target_project_id}
+        return httpx.Response(200, json=_issue(iid=99))
+
+    client = GitLabClient(
+        "https://gitlab.zingplay.com",
+        "glpat-test-token",
+        allowed_project_ids=frozenset({PROJECT_ID, target_project_id}),
+        transport=httpx.MockTransport(handler),
+    )
+
+    moved = await client.move_issue(PROJECT_ID, 42, target_project_id)
+
+    assert moved.project_id == target_project_id
+    assert moved.iid == 99
+    with pytest.raises(ValueError, match="allowlist"):
+        await client.move_issue(PROJECT_ID, 42, target_project_id + 1)
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_moved_issue_reads_source_then_global_target() -> None:
+    target_project_id = 357
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues/42":
+            source = _issue()
+            source.update({"id": 100, "moved_to_id": 200})
+            return httpx.Response(200, json=source)
+        if request.url.path == "/api/v4/issues/200":
+            target = _issue(iid=99)
+            target.update({"id": 200, "project_id": target_project_id})
+            return httpx.Response(200, json=target)
+        if request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues/43":
+            source = _issue(iid=43)
+            source.update({"id": 101, "moved_to_id": None})
+            return httpx.Response(200, json=source)
+        raise AssertionError(f"unexpected route {request.url.path}")
+
+    client = GitLabClient(
+        "https://gitlab.zingplay.com",
+        "glpat-test-token",
+        allowed_project_ids=frozenset({PROJECT_ID, target_project_id}),
+        transport=httpx.MockTransport(handler),
+    )
+
+    moved = await client.resolve_moved_issue(PROJECT_ID, 42, target_project_id)
+
+    assert moved is not None
+    assert moved.id == 200
+    assert moved.project_id == target_project_id
+    assert await client.resolve_moved_issue(PROJECT_ID, 43, target_project_id) is None
+    assert calls == [
+        f"/api/v4/projects/{PROJECT_ID}/issues/42",
+        "/api/v4/issues/200",
+        f"/api/v4/projects/{PROJECT_ID}/issues/43",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_moved_issue_rejects_unexpected_target_project() -> None:
+    expected_target_project_id = 357
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues/42":
+            source = _issue()
+            source.update({"id": 100, "moved_to_id": 200})
+            return httpx.Response(200, json=source)
+        if request.url.path == "/api/v4/issues/200":
+            target = _issue(iid=99)
+            target.update({"id": 200, "project_id": 358})
+            return httpx.Response(200, json=target)
+        raise AssertionError(f"unexpected route {request.url.path}")
+
+    client = GitLabClient(
+        "https://gitlab.zingplay.com",
+        "glpat-test-token",
+        allowed_project_ids=frozenset({PROJECT_ID, expected_target_project_id}),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ValueError, match="expected target"):
+        await client.resolve_moved_issue(PROJECT_ID, 42, expected_target_project_id)
+
+
+@pytest.mark.asyncio
 async def test_client_rejects_project_outside_injected_allowlist() -> None:
     client = _client(lambda request: pytest.fail(f"unexpected request: {request.url}"))
     with pytest.raises(ValueError, match="allowlist"):

@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from robomp.config import Settings
 from robomp.git_ops import (
@@ -89,28 +89,50 @@ def _gh_error_response(exc: GitHubError) -> JSONResponse:
     )
 
 
-def _gitlab_error_response(exc: GitLabError, *, token: str) -> JSONResponse:
-    """Return an upstream GitLab failure without ever reflecting the PAT."""
+def _configured_gitlab_tokens(cfg: Settings) -> tuple[str, ...]:
+    """Return every configured GitLab credential for error scrubbing only."""
+    tokens: list[str] = []
+    for secret in (cfg.gitlab_token, cfg.gitlab_routing_token):
+        if secret is not None:
+            tokens.append(secret.get_secret_value())
+    tokens.extend(secret.get_secret_value() for secret in cfg.gitlab_project_tokens.values())
+    return tuple(sorted(dict.fromkeys(tokens), key=len, reverse=True))
+
+
+def _scrub_gitlab_tokens(message: str, cfg: Settings) -> str:
+    for token in _configured_gitlab_tokens(cfg):
+        message = message.replace(token, "********")
+    return message
+
+
+def _gitlab_error_response(exc: GitLabError, *, settings: Settings) -> JSONResponse:
+    """Return an upstream GitLab failure without reflecting any configured PAT."""
     return JSONResponse(
         {
             "error": {
                 "kind": "gitlab",
                 "status": exc.status,
-                "message": exc.message.replace(token, "********"),
+                "message": _scrub_gitlab_tokens(exc.message, settings),
             }
         },
         status_code=exc.status,
     )
 
 
-def _git_error_response(exc: GitCommandError, *, head_drift: bool = False) -> JSONResponse:
+def _git_error_response(
+    exc: GitCommandError,
+    *,
+    head_drift: bool = False,
+    settings: Settings | None = None,
+) -> JSONResponse:
+    scrub = (lambda value: _scrub_gitlab_tokens(value, settings)) if settings is not None else (lambda value: value)
     payload: dict[str, Any] = {
         "error": {
             "kind": "head_drift" if head_drift else "git",
             "returncode": exc.returncode,
-            "cmd": exc.cmd,
-            "stdout": exc.stdout,
-            "stderr": exc.stderr,
+            "cmd": [scrub(str(part)) for part in exc.cmd],
+            "stdout": scrub(exc.stdout),
+            "stderr": scrub(exc.stderr),
         }
     }
     # 409 for head drift (concurrent commit detected); 502 for everything else.
@@ -243,10 +265,22 @@ def _resolve_hmac_key(cfg: Settings) -> bytes:
     return cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
 
 
-def _resolve_gitlab_token(cfg: Settings) -> str:
+def _resolve_gitlab_project_token(cfg: Settings, project_id: int) -> str:
+    if cfg.gitlab_project_tokens_configured:
+        secret = cfg.gitlab_project_tokens.get(project_id)
+        if secret is None:
+            raise HTTPException(503, "GitLab credentials for project are not configured")
+        return secret.get_secret_value()
     if cfg.gitlab_token is None:
         raise HTTPException(503, "GitLab proxy is not configured")
     return cfg.gitlab_token.get_secret_value()
+
+
+def _resolve_gitlab_routing_token(cfg: Settings) -> str:
+    secret = cfg.gitlab_routing_token or cfg.gitlab_token
+    if secret is None:
+        raise HTTPException(503, "GitLab routing credentials are not configured")
+    return secret.get_secret_value()
 
 
 _ORIGIN_READ_TIMEOUT_SECONDS = 5.0
@@ -261,6 +295,8 @@ _GIT_PROBE_SCRUBBED_ENV_KEYS = (
     "GH_TOKEN",
     "GITHUB_WEBHOOK_SECRET",
     "ROBOMP_GITLAB_TOKEN",
+    "ROBOMP_GITLAB_ROUTING_TOKEN",
+    "ROBOMP_GITLAB_PROJECT_TOKENS_JSON",
     "ROBOMP_GITLAB_WEBHOOK_SECRET",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
@@ -556,11 +592,34 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             app.state.github = GitHubClient(_resolve_token(settings))
         if settings.gitlab_proxy_enabled:
             assert settings.gitlab_base_url is not None
-            app.state.gitlab = GitLabClient(
-                settings.gitlab_base_url,
-                _resolve_gitlab_token(settings),
-                allowed_project_ids=settings.gitlab_project_ids,
-            )
+            project_clients: dict[int, GitLabClient] = {}
+            if settings.gitlab_project_tokens_configured:
+                project_tokens = settings.gitlab_project_tokens
+                for project_id in settings.gitlab_project_ids:
+                    secret = project_tokens.get(project_id)
+                    if secret is not None:
+                        project_clients[project_id] = GitLabClient(
+                            settings.gitlab_base_url,
+                            secret.get_secret_value(),
+                            allowed_project_ids=frozenset({project_id}),
+                        )
+            elif settings.gitlab_token is not None:
+                token = settings.gitlab_token.get_secret_value()
+                project_clients = {
+                    project_id: GitLabClient(
+                        settings.gitlab_base_url,
+                        token,
+                        allowed_project_ids=frozenset({project_id}),
+                    )
+                    for project_id in settings.gitlab_project_ids
+                }
+            app.state.gitlab_by_project = project_clients
+            if settings.gitlab_routing_token is not None or settings.gitlab_token is not None:
+                app.state.gitlab_routing = GitLabClient(
+                    settings.gitlab_base_url,
+                    _resolve_gitlab_routing_token(settings),
+                    allowed_project_ids=settings.gitlab_project_ids,
+                )
         app.state.settings = settings
         yield
 
@@ -638,10 +697,19 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             raise HTTPException(503, "GitHub proxy is not configured")
         return client
 
-    def _gitlab_client(request: Request) -> GitLabClient:
-        client = getattr(request.app.state, "gitlab", None)
-        if not isinstance(client, GitLabClient):
+    def _gitlab_project_client(request: Request, project_id: int) -> GitLabClient:
+        clients = getattr(request.app.state, "gitlab_by_project", None)
+        if not isinstance(clients, dict):
             raise HTTPException(503, "GitLab proxy is not configured")
+        client = clients.get(project_id)
+        if not isinstance(client, GitLabClient):
+            raise HTTPException(503, "GitLab credentials for project are not configured")
+        return client
+
+    def _gitlab_routing_client(request: Request) -> GitLabClient:
+        client = getattr(request.app.state, "gitlab_routing", None)
+        if not isinstance(client, GitLabClient):
+            raise HTTPException(503, "GitLab routing credentials are not configured")
         return client
 
     # ---- meta ----
@@ -908,26 +976,32 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     # validate it before touching the upstream client. There is no generic
     # passthrough route: each operation is explicitly named and typed.
     @app.get("/gl/v1/authenticated_user")
-    async def get_gitlab_authenticated_user(request: Request) -> JSONResponse:
+    async def get_gitlab_authenticated_user(
+        request: Request,
+        project_id: int | None = None,
+    ) -> JSONResponse:
         await _authenticate(request)
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+        if project_id is None:
+            gitlab = _gitlab_routing_client(request)
+        else:
+            project_id = _require_gitlab_project_id(settings, project_id)
+            gitlab = _gitlab_project_client(request, project_id)
         try:
-            user: GitLabUserInfo = await gitlab.get_authenticated_user()
+            user: GitLabUserInfo = await gitlab.get_authenticated_user(project_id)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(user))
 
     @app.get("/gl/v1/projects/{project_id}")
     async def get_gitlab_project(request: Request, project_id: int) -> JSONResponse:
         await _authenticate(request)
         project_id = _require_gitlab_project_id(settings, project_id)
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             project = await gitlab.get_project(project_id)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         trusted_clone = _trusted_gitlab_clone_url(settings.gitlab_base_url or "", project, project_id=project_id)
         payload = _serialize(project)
         payload["http_url_to_repo"] = trusted_clone
@@ -938,12 +1012,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         await _authenticate(request)
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             issue = await gitlab.get_issue(project_id, iid)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(issue))
 
     @app.get("/gl/v1/projects/{project_id}/issues/{iid}/related_merge_requests")
@@ -955,12 +1029,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         await _authenticate(request)
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             merge_requests = await gitlab.list_issue_related_merge_requests(project_id, iid)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse({"items": [_serialize(merge_request) for merge_request in merge_requests]})
 
     @app.get("/gl/v1/projects/{project_id}/issues/{iid}/closed_by")
@@ -972,12 +1046,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         await _authenticate(request)
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             merge_requests = await gitlab.list_issue_closed_by_merge_requests(project_id, iid)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse({"items": [_serialize(merge_request) for merge_request in merge_requests]})
 
     @app.get("/gl/v1/projects/{project_id}/issues/{iid}/notes")
@@ -985,12 +1059,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         await _authenticate(request)
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             notes = await gitlab.list_issue_notes(project_id, iid)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse({"items": [_serialize(note) for note in notes]})
 
     @app.post("/gl/v1/projects/{project_id}/issues/{iid}/notes")
@@ -999,12 +1073,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
         body = _require_str(data.get("body"), "body")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             note = await gitlab.post_issue_note(project_id, iid, body)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(note))
 
     @app.put("/gl/v1/projects/{project_id}/issues/{iid}/labels")
@@ -1015,12 +1089,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         labels = _optional_str_list(data.get("labels"), "labels")
         if labels is None:
             raise HTTPException(400, "missing/invalid 'labels'")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             issue = await gitlab.update_issue_labels(project_id, iid, labels)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(issue))
 
     @app.post("/gl/v1/projects/{project_id}/issues/{iid}/labels/add")
@@ -1031,12 +1105,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         labels = _optional_str_list(data.get("labels"), "labels")
         if labels is None:
             raise HTTPException(400, "missing/invalid 'labels'")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             issue = await gitlab.add_issue_labels(project_id, iid, labels)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(issue))
 
     @app.post("/gl/v1/projects/{project_id}/issues/{iid}/labels/remove")
@@ -1047,12 +1121,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         labels = _optional_str_list(data.get("labels"), "labels")
         if labels is None:
             raise HTTPException(400, "missing/invalid 'labels'")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             issue = await gitlab.remove_issue_labels(project_id, iid, labels)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(issue))
 
     @app.post("/gl/v1/projects/{project_id}/issues/{iid}/close")
@@ -1062,12 +1136,43 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             raise HTTPException(400, "GitLab close request body must be empty")
         project_id = _require_gitlab_project_id(settings, project_id)
         iid = _require_positive_int(iid, "iid")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             issue = await gitlab.close_issue(project_id, iid)
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/move")
+    async def move_gitlab_issue(request: Request, project_id: int, iid: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        to_project_id = _require_gitlab_project_id(settings, data.get("to_project_id"))
+        gitlab = _gitlab_routing_client(request)
+        try:
+            issue = await gitlab.move_issue(project_id, iid, to_project_id)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, settings=settings)
+        return JSONResponse(_serialize(issue))
+
+    @app.post("/gl/v1/projects/{project_id}/issues/{iid}/resolve_moved")
+    async def resolve_gitlab_moved_issue(request: Request, project_id: int, iid: int) -> Response:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        iid = _require_positive_int(iid, "iid")
+        expected_target_project_id = _require_gitlab_project_id(
+            settings,
+            data.get("expected_target_project_id"),
+        )
+        gitlab = _gitlab_routing_client(request)
+        try:
+            issue = await gitlab.resolve_moved_issue(project_id, iid, expected_target_project_id)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, settings=settings)
+        if issue is None:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         return JSONResponse(_serialize(issue))
 
     @app.post("/gl/v1/projects/{project_id}/merge_requests")
@@ -1078,8 +1183,8 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         target_branch = _require_str(data.get("target_branch"), "target_branch")
         title = _require_str(data.get("title"), "title")
         description = _require_str(data.get("description"), "description")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             merge_request: GitLabMergeRequestInfo = await gitlab.create_merge_request(
                 project_id,
@@ -1089,7 +1194,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 description=description,
             )
         except GitLabError as exc:
-            return _gitlab_error_response(exc, token=token)
+            return _gitlab_error_response(exc, settings=settings)
         return JSONResponse(_serialize(merge_request))
 
     # ---- git transport ----
@@ -1248,12 +1353,12 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         base_url = settings.gitlab_base_url
         if base_url is None:
             raise HTTPException(503, "GitLab proxy is not configured")
-        token = _resolve_gitlab_token(settings)
-        gitlab = _gitlab_client(request)
+        token = _resolve_gitlab_project_token(settings, project_id)
+        gitlab = _gitlab_project_client(request, project_id)
         try:
             project = await gitlab.get_project(project_id)
         except GitLabError as exc:
-            raise HTTPException(exc.status, exc.message.replace(token, "********")) from exc
+            raise HTTPException(exc.status, _scrub_gitlab_tokens(exc.message, settings)) from exc
         # Validate ID and clone destination before the path is used for either
         # filesystem selection or token-scoped git authentication.
         _trusted_gitlab_clone_url(base_url, project, project_id=project_id)
@@ -1278,7 +1383,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 auth_url=trusted_url,
             )
         except GitCommandError as exc:
-            return _git_error_response(exc)
+            return _git_error_response(exc, settings=settings)
         return JSONResponse({"pool_dir": str(target)})
 
     @app.post("/gl/v1/projects/{project_id}/git/fetch")
@@ -1305,7 +1410,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 auth_url=remote.auth_url,
             )
         except GitCommandError as exc:
-            return _git_error_response(exc)
+            return _git_error_response(exc, settings=settings)
         return JSONResponse({"pool_dir": str(target)})
 
     @app.post("/gl/v1/projects/{project_id}/git/fetch_ref")
@@ -1372,9 +1477,9 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 slot_uid=slot_uid,
             )
         except HeadDriftError as exc:
-            return _git_error_response(exc, head_drift=True)
+            return _git_error_response(exc, head_drift=True, settings=settings)
         except GitCommandError as exc:
-            return _git_error_response(exc)
+            return _git_error_response(exc, settings=settings)
         return JSONResponse({"head": result.head, "branch": result.branch})
 
     # Expose for tests

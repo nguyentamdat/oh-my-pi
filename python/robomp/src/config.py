@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
 from functools import cache
@@ -10,6 +11,8 @@ from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from robomp.routing import RoutingPolicy
 
 ThinkingLevel = Literal["off", "low", "medium", "high", "xhigh", "max"]
 
@@ -25,6 +28,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     # GitHub
@@ -48,12 +52,18 @@ class Settings(BaseSettings):
     # receives this variable; `load_proxy_settings()` is the only loader that
     # may materialize it for the credential-holding proxy process.
     gitlab_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_TOKEN")
+    gitlab_routing_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_ROUTING_TOKEN")
+    gitlab_project_tokens_json: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_PROJECT_TOKENS_JSON")
     gitlab_webhook_secret: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_WEBHOOK_SECRET")
     gitlab_project_ids_raw: str = Field("", alias="ROBOMP_GITLAB_PROJECT_IDS")
     gitlab_bot_login: str = Field("", alias="ROBOMP_GITLAB_BOT_LOGIN")
+    gitlab_bot_logins_raw: str = Field("", alias="ROBOMP_GITLAB_BOT_LOGINS")
     # Only labeled GitLab issues begin automated work. This is intentionally
     # non-secret so ingress may receive it while the PAT stays in the proxy.
     gitlab_trigger_label: str = Field("roboomp", alias="ROBOMP_GITLAB_TRIGGER_LABEL")
+    # Optional cross-project issue routing policy. Parsed and validated at
+    # startup so a malformed operator policy cannot reach webhook handling.
+    gitlab_routing_policy_raw: str = Field("", alias="ROBOMP_GITLAB_ROUTING_POLICY")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
     # PR review trigger. "open" (default) reviews incoming PRs on
     # opened/reopened/ready_for_review. "vouched_label" DEFERS review until the
@@ -192,7 +202,9 @@ class Settings(BaseSettings):
             return value.strip().rstrip("/") or None
         return value
 
-    @field_validator("github_webhook_secret", "gitlab_webhook_secret", "gitlab_token", mode="before")
+    @field_validator(
+        "github_webhook_secret", "gitlab_webhook_secret", "gitlab_token", "gitlab_routing_token", mode="before"
+    )
     @classmethod
     def _blank_forge_secret_disables(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -325,8 +337,28 @@ class Settings(BaseSettings):
             )
         if all(ingress_configured) and not self.gitlab_bot_login:
             raise ValueError("ROBOMP_GITLAB_BOT_LOGIN must be set when GitLab ingress is enabled.")
-        if self.gitlab_token is not None:
-            raise ValueError("ROBOMP_GITLAB_TOKEN is proxy-only; configure it only for `python -m robomp.proxy serve`.")
+        if (
+            self.gitlab_token is not None
+            or self.gitlab_routing_token is not None
+            or self.gitlab_project_tokens_configured
+        ):
+            raise ValueError(
+                "GitLab credentials are proxy-only; configure them only for `python -m robomp.proxy serve`."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_gitlab_routing_policy(self) -> Settings:
+        policy = self.gitlab_routing_policy
+        if policy is None:
+            return self
+        admitted = self.gitlab_project_ids
+        required = {policy.intake_project_id, *(target.project_id for target in policy.targets)}
+        missing = sorted(required - admitted)
+        if missing:
+            raise ValueError(
+                f"ROBOMP_GITLAB_PROJECT_IDS must include the routing intake and every target; missing {missing}"
+            )
         return self
 
     @model_validator(mode="after")
@@ -378,6 +410,58 @@ class Settings(BaseSettings):
             project_ids.add(project_id)
         return frozenset(project_ids)
 
+    @staticmethod
+    def _parse_gitlab_project_tokens(raw: str) -> dict[int, SecretStr]:
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("ROBOMP_GITLAB_PROJECT_TOKENS_JSON must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("ROBOMP_GITLAB_PROJECT_TOKENS_JSON must be a JSON object")
+        tokens: dict[int, SecretStr] = {}
+        for project_id_text, token in payload.items():
+            if not isinstance(project_id_text, str) or re.fullmatch(r"[1-9][0-9]*", project_id_text) is None:
+                raise ValueError("GitLab project token keys must be positive decimal project IDs")
+            if not isinstance(token, str) or not token.strip():
+                raise ValueError("GitLab project tokens must be non-empty strings")
+            tokens[int(project_id_text)] = SecretStr(token)
+        return tokens
+
+    @field_validator("gitlab_project_tokens_json", mode="before")
+    @classmethod
+    def _validate_gitlab_project_tokens(cls, value: object) -> object:
+        raw = value.get_secret_value() if hasattr(value, "get_secret_value") else value
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("ROBOMP_GITLAB_PROJECT_TOKENS_JSON must be a JSON object")
+        cls._parse_gitlab_project_tokens(raw)
+        return value
+
+    @property
+    def gitlab_project_tokens(self) -> dict[int, SecretStr]:
+        raw = self.gitlab_project_tokens_json
+        return self._parse_gitlab_project_tokens(raw.get_secret_value() if raw is not None else "")
+
+    @property
+    def gitlab_project_tokens_configured(self) -> bool:
+        return self.gitlab_project_tokens_json is not None
+
+    @property
+    def gitlab_bot_logins(self) -> frozenset[str]:
+        """All GitLab service-account logins ignored by webhook ingress."""
+        values = {self.gitlab_bot_login.casefold()} if self.gitlab_bot_login else set()
+        values.update(piece.strip().casefold() for piece in self.gitlab_bot_logins_raw.split(",") if piece.strip())
+        return frozenset(values)
+
+    @property
+    def gitlab_routing_policy(self) -> RoutingPolicy | None:
+        """Parsed optional cross-project routing policy."""
+        raw = self.gitlab_routing_policy_raw.strip()
+        return RoutingPolicy.from_json(raw) if raw else None
+
     @property
     def gitlab_enabled(self) -> bool:
         """Whether GitLab webhook ingress is configured."""
@@ -386,7 +470,12 @@ class Settings(BaseSettings):
     @property
     def gitlab_proxy_enabled(self) -> bool:
         """Whether this credential-holding proxy may serve GitLab requests."""
-        return self.gitlab_token is not None and self.gitlab_base_url is not None and bool(self.gitlab_project_ids)
+        has_credentials = (
+            self.gitlab_token is not None
+            or self.gitlab_routing_token is not None
+            or self.gitlab_project_tokens_configured
+        )
+        return has_credentials and self.gitlab_base_url is not None and bool(self.gitlab_project_ids)
 
     @field_validator("rate_limit_unlimited_raw", mode="before")
     @classmethod
@@ -523,11 +612,14 @@ class _ProxyEnvLoader(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     github_token: SecretStr | None = Field(None, alias="GITHUB_TOKEN")
     gh_proxy_hmac_key: SecretStr = Field(..., alias="ROBOMP_GH_PROXY_HMAC_KEY")
     gitlab_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_TOKEN")
+    gitlab_routing_token: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_ROUTING_TOKEN")
+    gitlab_project_tokens_json: SecretStr | None = Field(None, alias="ROBOMP_GITLAB_PROJECT_TOKENS_JSON")
     gitlab_base_url: str | None = Field(None, alias="ROBOMP_GITLAB_BASE_URL")
     gitlab_project_ids_raw: str = Field("", alias="ROBOMP_GITLAB_PROJECT_IDS")
     gh_proxy_bind_host: str = Field("0.0.0.0", alias="ROBOMP_GH_PROXY_BIND_HOST")
@@ -559,7 +651,7 @@ class _ProxyEnvLoader(BaseSettings):
                 return None
         return value
 
-    @field_validator("gitlab_token", mode="before")
+    @field_validator("gitlab_token", "gitlab_routing_token", mode="before")
     @classmethod
     def _blank_gitlab_token_disables(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -582,15 +674,29 @@ class _ProxyEnvLoader(BaseSettings):
     def _coerce_proxy_gitlab_project_ids(cls, value: object) -> str:
         return Settings._coerce_gitlab_project_ids(value)
 
+    @field_validator("gitlab_project_tokens_json", mode="before")
+    @classmethod
+    def _validate_proxy_gitlab_project_tokens(cls, value: object) -> object:
+        raw = value.get_secret_value() if hasattr(value, "get_secret_value") else value
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("ROBOMP_GITLAB_PROJECT_TOKENS_JSON must be a JSON object")
+        Settings._parse_gitlab_project_tokens(raw)
+        return value
+
     @model_validator(mode="after")
     def _validate_gitlab_proxy(self) -> _ProxyEnvLoader:
         project_ids = Settings.model_construct(gitlab_project_ids_raw=self.gitlab_project_ids_raw).gitlab_project_ids
-        if self.gitlab_token is not None and (self.gitlab_base_url is None or not project_ids):
-            raise ValueError(
-                "ROBOMP_GITLAB_TOKEN requires ROBOMP_GITLAB_BASE_URL and ROBOMP_GITLAB_PROJECT_IDS in the proxy."
-            )
-        if self.github_token is None and self.gitlab_token is None:
-            raise ValueError("proxy requires GITHUB_TOKEN or ROBOMP_GITLAB_TOKEN")
+        has_gitlab_credentials = (
+            self.gitlab_token is not None
+            or self.gitlab_routing_token is not None
+            or self.gitlab_project_tokens_json is not None
+        )
+        if has_gitlab_credentials and (self.gitlab_base_url is None or not project_ids):
+            raise ValueError("GitLab proxy credentials require ROBOMP_GITLAB_BASE_URL and ROBOMP_GITLAB_PROJECT_IDS.")
+        if self.github_token is None and not has_gitlab_credentials:
+            raise ValueError("proxy requires GITHUB_TOKEN or GitLab proxy credentials")
         return self
 
 
@@ -612,6 +718,8 @@ def load_proxy_settings() -> Settings:
         gh_proxy_url=None,
         gh_proxy_hmac_key=loader.gh_proxy_hmac_key,
         gitlab_token=loader.gitlab_token,
+        gitlab_routing_token=loader.gitlab_routing_token,
+        gitlab_project_tokens_json=loader.gitlab_project_tokens_json,
         gitlab_base_url=loader.gitlab_base_url,
         gitlab_project_ids_raw=loader.gitlab_project_ids_raw,
         gh_proxy_bind_host=loader.gh_proxy_bind_host,

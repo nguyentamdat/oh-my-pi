@@ -14,6 +14,7 @@ CanonicalEvent = Literal[
     "issue.closed",
     "issue.reopened",
     "issue.comment.created",
+    "issue.routed",
     "change.opened",
     "change.closed",
     "change.merged",
@@ -22,6 +23,8 @@ CanonicalEvent = Literal[
 ]
 TaskKind = Literal[
     "triage_issue",
+    "route_issue",
+    "routing_complete",
     "handle_comment",
     "handle_pr_conversation",
     "review_change",

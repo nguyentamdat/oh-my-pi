@@ -13,9 +13,14 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from robomp.config import Settings
-from robomp.gitlab_client import GitLabClient, GitLabProjectInfo
+from robomp.gitlab_client import GitLabClient, GitLabError, GitLabProjectInfo
 from robomp.gitlab_proxy_client import GitLabProxyClient, GitLabProxyGitTransport
-from robomp.proxy.server import _gitlab_pool_dir, _trusted_gitlab_clone_url, create_proxy_app
+from robomp.proxy.server import (
+    _gitlab_pool_dir,
+    _resolve_gitlab_project_token,
+    _trusted_gitlab_clone_url,
+    create_proxy_app,
+)
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, sign, verify
 from robomp.sandbox import SandboxManager
 
@@ -59,10 +64,58 @@ def _app(tmp_path: Path, handler) -> object:
     cfg = _settings(tmp_path)
     app = create_proxy_app(cfg)
     app.state.settings = cfg
-    app.state.gitlab = GitLabClient(
+    app.state.gitlab_by_project = {
+        _PROJECT_ID: GitLabClient(
+            _BASE_URL,
+            _GITLAB_TOKEN,
+            allowed_project_ids=frozenset({_PROJECT_ID}),
+            transport=httpx.MockTransport(handler),
+        )
+    }
+    app.state.gitlab_routing = GitLabClient(
         _BASE_URL,
         _GITLAB_TOKEN,
         allowed_project_ids=frozenset({_PROJECT_ID}),
+        transport=httpx.MockTransport(handler),
+    )
+    return app
+
+
+def _mapped_app(
+    tmp_path: Path,
+    handler,
+    *,
+    project_ids: frozenset[int],
+    project_tokens: dict[int, str],
+    routing_token: str,
+    legacy_token: str | None = None,
+) -> object:
+    cfg = _settings(tmp_path).model_copy(
+        update={
+            "gitlab_token": SecretStr(legacy_token) if legacy_token is not None else None,
+            "gitlab_routing_token": SecretStr(routing_token),
+            "gitlab_project_tokens_json": SecretStr(
+                json.dumps({str(project_id): token for project_id, token in project_tokens.items()})
+            ),
+            "gitlab_project_ids_raw": ",".join(str(project_id) for project_id in sorted(project_ids)),
+        }
+    )
+    cfg.ensure_paths()
+    app = create_proxy_app(cfg)
+    app.state.settings = cfg
+    app.state.gitlab_by_project = {
+        project_id: GitLabClient(
+            _BASE_URL,
+            token,
+            allowed_project_ids=frozenset({project_id}),
+            transport=httpx.MockTransport(handler),
+        )
+        for project_id, token in project_tokens.items()
+    }
+    app.state.gitlab_routing = GitLabClient(
+        _BASE_URL,
+        routing_token,
+        allowed_project_ids=project_ids,
         transport=httpx.MockTransport(handler),
     )
     return app
@@ -113,6 +166,230 @@ async def test_gitlab_project_allowlist_allows_356_and_denies_other_project(tmp_
     assert allowed.json()["id"] == _PROJECT_ID
     assert denied.status_code == 403
     assert len(calls) == 1
+
+
+async def test_project_token_map_selects_exact_project_client(tmp_path: Path) -> None:
+    source_project_id = _PROJECT_ID
+    target_project_id = 357
+    source_token = "glpat-source-token"
+    target_token = "glpat-target-token"
+    routing_token = "glpat-routing-token"
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers["PRIVATE-TOKEN"]))
+        project_id = int(request.url.path.split("/")[4])
+        return httpx.Response(
+            200,
+            json={
+                "id": project_id * 10,
+                "iid": 7,
+                "title": "T",
+                "description": "D",
+                "state": "opened",
+                "author": {"username": "alice"},
+                "labels": [],
+                "web_url": f"{_BASE_URL}/group/widget/-/issues/7",
+            },
+        )
+
+    app = _mapped_app(
+        tmp_path,
+        handler,
+        project_ids=frozenset({source_project_id, target_project_id}),
+        project_tokens={source_project_id: source_token, target_project_id: target_token},
+        routing_token=routing_token,
+    )
+    proxy = GitLabProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    assert (await proxy.get_issue(source_project_id, 7)).project_id == source_project_id
+    assert (await proxy.get_issue(target_project_id, 7)).project_id == target_project_id
+    cfg = app.state.settings
+    assert _resolve_gitlab_project_token(cfg, source_project_id) == source_token
+    assert _resolve_gitlab_project_token(cfg, target_project_id) == target_token
+    assert seen == [
+        (f"/api/v4/projects/{source_project_id}/issues/7", source_token),
+        (f"/api/v4/projects/{target_project_id}/issues/7", target_token),
+    ]
+
+
+async def test_project_scoped_authenticated_user_uses_exact_project_token(tmp_path: Path) -> None:
+    source_project_id = _PROJECT_ID
+    target_project_id = 357
+    source_token = "glpat-source-token"
+    target_token = "glpat-target-token"
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v4/user"
+        seen.append(request.headers["PRIVATE-TOKEN"])
+        return httpx.Response(200, json={"id": 1, "username": "robomp", "name": "RoboMP"})
+
+    app = _mapped_app(
+        tmp_path,
+        handler,
+        project_ids=frozenset({source_project_id, target_project_id}),
+        project_tokens={source_project_id: source_token, target_project_id: target_token},
+        routing_token="glpat-routing-token",
+    )
+    proxy = GitLabProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    assert (await proxy.get_authenticated_user(source_project_id)).username == "robomp"
+    assert (await proxy.get_authenticated_user(target_project_id)).username == "robomp"
+    assert seen == [source_token, target_token]
+
+
+async def test_project_token_map_rejects_allowlisted_project_without_token(tmp_path: Path) -> None:
+    source_project_id = _PROJECT_ID
+    target_project_id = 357
+    upstream_calls: list[httpx.Request] = []
+    app = _mapped_app(
+        tmp_path,
+        lambda request: upstream_calls.append(request) or httpx.Response(200, json={}),
+        project_ids=frozenset({source_project_id, target_project_id}),
+        project_tokens={source_project_id: "glpat-source-token"},
+        routing_token="glpat-routing-token",
+    )
+    path = f"/gl/v1/projects/{target_project_id}/issues/7"
+
+    async with await _client(app) as client:
+        response = await client.get(path, headers=_headers("GET", path))
+
+    assert response.status_code == 503
+    assert upstream_calls == []
+
+
+async def test_move_and_recovery_use_routing_token_and_validate_both_projects(tmp_path: Path) -> None:
+    source_project_id = _PROJECT_ID
+    target_project_id = 357
+    source_token = "glpat-source-token"
+    target_token = "glpat-target-token"
+    routing_token = "glpat-routing-token"
+    seen: list[tuple[str, str, object]] = []
+
+    def issue_payload(*, iid: int, issue_id: int, moved_to_id: int | None = None) -> dict[str, object]:
+        return {
+            "id": issue_id,
+            "iid": iid,
+            "title": "T",
+            "description": "D",
+            "state": "opened",
+            "author": {"username": "alice"},
+            "labels": [],
+            "moved_to_id": moved_to_id,
+            "web_url": f"{_BASE_URL}/group/widget/-/issues/{iid}",
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.url.path, request.headers["PRIVATE-TOKEN"], body))
+        if request.url.path == f"/api/v4/projects/{source_project_id}/issues/7/move":
+            assert body == {"to_project_id": target_project_id}
+            return httpx.Response(200, json=issue_payload(iid=99, issue_id=200))
+        if request.url.path == f"/api/v4/projects/{source_project_id}/issues/7":
+            return httpx.Response(200, json=issue_payload(iid=7, issue_id=100, moved_to_id=200))
+        if request.url.path == "/api/v4/issues/200":
+            payload = issue_payload(iid=99, issue_id=200)
+            payload["project_id"] = target_project_id
+            return httpx.Response(200, json=payload)
+        if request.url.path == f"/api/v4/projects/{source_project_id}/issues/8":
+            return httpx.Response(200, json=issue_payload(iid=8, issue_id=101))
+        raise AssertionError(f"unexpected route {request.url.path}")
+
+    app = _mapped_app(
+        tmp_path,
+        handler,
+        project_ids=frozenset({source_project_id, target_project_id}),
+        project_tokens={source_project_id: source_token, target_project_id: target_token},
+        routing_token=routing_token,
+    )
+    proxy = GitLabProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    moved = await proxy.move_issue(source_project_id, 7, target_project_id)
+    recovered = await proxy.resolve_moved_issue(source_project_id, 7, target_project_id)
+    assert await proxy.resolve_moved_issue(source_project_id, 8, target_project_id) is None
+
+    assert moved.project_id == target_project_id
+    assert moved.id == 200
+    assert recovered is not None
+    assert recovered.project_id == target_project_id
+    assert recovered.id == 200
+    assert seen == [
+        (f"/api/v4/projects/{source_project_id}/issues/7/move", routing_token, {"to_project_id": target_project_id}),
+        (f"/api/v4/projects/{source_project_id}/issues/7", routing_token, None),
+        ("/api/v4/issues/200", routing_token, None),
+        (f"/api/v4/projects/{source_project_id}/issues/8", routing_token, None),
+    ]
+
+    async with await _client(app) as client:
+        disallowed_target_path = f"/gl/v1/projects/{source_project_id}/issues/7/move"
+        disallowed_target_body = b'{"to_project_id":358}'
+        disallowed_target = await client.post(
+            disallowed_target_path,
+            content=disallowed_target_body,
+            headers={
+                **_headers("POST", disallowed_target_path, disallowed_target_body),
+                "Content-Type": "application/json",
+            },
+        )
+        disallowed_source_path = "/gl/v1/projects/358/issues/7/move"
+        disallowed_source_body = b'{"to_project_id":356}'
+        disallowed_source = await client.post(
+            disallowed_source_path,
+            content=disallowed_source_body,
+            headers={
+                **_headers("POST", disallowed_source_path, disallowed_source_body),
+                "Content-Type": "application/json",
+            },
+        )
+    assert disallowed_target.status_code == 403
+    assert disallowed_source.status_code == 403
+    assert len(seen) == 4
+
+
+async def test_move_error_scrubs_every_configured_gitlab_token(tmp_path: Path) -> None:
+    legacy_token = "glpat-prefix"
+    source_token = "glpat-source-token"
+    target_token = "glpat-target-token"
+    routing_token = "glpat-prefix-routing-token"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"message": f"{legacy_token} {target_token} {routing_token}"},
+        )
+
+    app = _mapped_app(
+        tmp_path,
+        handler,
+        project_ids=frozenset({_PROJECT_ID, 357}),
+        project_tokens={_PROJECT_ID: source_token, 357: target_token},
+        routing_token=routing_token,
+        legacy_token=legacy_token,
+    )
+    proxy = GitLabProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    with pytest.raises(GitLabError) as exc:
+        await proxy.move_issue(_PROJECT_ID, 7, 357)
+
+    assert all(token not in str(exc.value) for token in (legacy_token, source_token, target_token, routing_token))
+    assert str(exc.value) == "GitLab 401: ******** ******** ********"
 
 
 async def test_gitlab_proxy_client_uses_only_typed_project_api_shapes(tmp_path: Path) -> None:

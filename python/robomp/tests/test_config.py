@@ -110,6 +110,70 @@ def test_proxy_loader_enables_gitlab_only_with_proxy_token(
     assert cfg.gitlab_project_ids == frozenset({356})
 
 
+def test_proxy_loader_parses_routing_and_project_token_map(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    routing_token = "glpat-routing-token"
+    project_356_token = "glpat-project-356-token"
+    project_357_token = "glpat-project-357-token"
+    monkeypatch.delenv("GITHUB_TOKEN")
+    monkeypatch.delenv("ROBOMP_GITLAB_TOKEN", raising=False)
+    monkeypatch.setenv("ROBOMP_GITLAB_ROUTING_TOKEN", routing_token)
+    monkeypatch.setenv(
+        "ROBOMP_GITLAB_PROJECT_TOKENS_JSON",
+        '{"356":"glpat-project-356-token","357":"glpat-project-357-token"}',
+    )
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.example.test/")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356,357")
+
+    cfg = load_proxy_settings()
+
+    assert cfg.gitlab_proxy_enabled
+    assert cfg.gitlab_token is None
+    assert cfg.gitlab_routing_token is not None
+    assert cfg.gitlab_routing_token.get_secret_value() == routing_token
+    assert {project_id: token.get_secret_value() for project_id, token in cfg.gitlab_project_tokens.items()} == {
+        356: project_356_token,
+        357: project_357_token,
+    }
+    assert all(token not in repr(cfg) for token in (routing_token, project_356_token, project_357_token))
+
+
+def test_proxy_loader_hides_project_tokens_from_invalid_map_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    project_token = "glpat-project-token-must-not-leak"
+    monkeypatch.delenv("GITHUB_TOKEN")
+    monkeypatch.delenv("ROBOMP_GITLAB_TOKEN", raising=False)
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://gitlab.example.test/")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "356")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_TOKENS_JSON", '{"not-a-project-id":"glpat-project-token-must-not-leak"}')
+
+    with pytest.raises(ValidationError) as exc:
+        load_proxy_settings()
+
+    assert project_token not in str(exc.value)
+
+
+def test_new_gitlab_proxy_credentials_are_rejected_by_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    routing_token = "glpat-routing-token"
+    project_token = "glpat-project-token"
+    monkeypatch.setenv("ROBOMP_GITLAB_ROUTING_TOKEN", routing_token)
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_TOKENS_JSON", '{"356":"glpat-project-token"}')
+    reset_settings_cache()
+
+    with pytest.raises(ValidationError, match="proxy-only") as exc:
+        Settings()  # type: ignore[call-arg]
+
+    assert routing_token not in str(exc.value)
+    assert project_token not in str(exc.value)
+
+
 def test_gitlab_config_rejects_partial_credentials(
     monkeypatch: pytest.MonkeyPatch,
     env: dict[str, str],
