@@ -100,9 +100,11 @@ GitLab integration is keyed by immutable numeric project IDs. It supports:
 - **Single-project mode:** omit `ROBOMP_GITLAB_ROUTING_POLICY`; an issue starts
   work only after it carries `ROBOMP_GITLAB_TRIGGER_LABEL`.
 - **Routing mode:** configure one intake project plus explicit target projects.
-  Intake issues are classified before any repository is cloned.
+  Deterministic policy evidence is augmented by bounded Hindsight recall and an
+  OpenAI-compatible local classifier before any repository is cloned.
 
-The orchestrator receives only routing metadata:
+The orchestrator receives routing metadata plus only the two classifier API
+keys; forge credentials remain proxy-only:
 
 ```dotenv
 ROBOMP_GITLAB_BASE_URL=https://gitlab.example.com
@@ -112,7 +114,19 @@ ROBOMP_GITLAB_BOT_LOGINS=<routing-bot>,<intake-bot>,<target-bot>
 ROBOMP_GITLAB_TRIGGER_LABEL=roboomp
 ROBOMP_GITLAB_WEBHOOK_SECRET=<random-webhook-secret>
 ROBOMP_GITLAB_ROUTING_POLICY={"intake_project_id":2080,"targets":[{"key":"server","project_id":356,"mode":"auto_implement","default_branch":"main","paths":["server"],"aliases":["server"],"signals":["server runtime"]}]}
+ROBOMP_ROUTING_LLM_BASE_URL=https://litellm.example.com/v1
+ROBOMP_ROUTING_LLM_API_KEY=<local-model-api-key>
+ROBOMP_ROUTING_LLM_MODEL=local-model-mini
+ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS=90
+ROBOMP_HINDSIGHT_BASE_URL=http://hindsight:8888
+ROBOMP_HINDSIGHT_API_KEY=<hindsight-tenant-api-key>
+ROBOMP_HINDSIGHT_BANK=omp
 ```
+
+Recall is untrusted context: it can rank policy targets but cannot supply the
+issue quote required for an automatic route. Unknown targets, malformed JSON,
+timeouts, and API failures fail closed to deterministic evidence or human
+routing. The classifier may return multiple directly affected targets.
 
 Every policy target declares one mode:
 
@@ -123,12 +137,22 @@ Every policy target declares one mode:
 - `auto_implement`: move first, then queue normal target-project triage only
   after the canonical target project and IID are durable.
 
-`route::<target>` labels are deterministic maintainer overrides. Multiple
-route labels remain ambiguous. Before moving, roboomp verifies that the live
-target default branch exactly matches the policy. Move recovery resolves
-GitLab's global issue ID through GraphQL and then reads the issue through the
-allowlisted destination project; no administrator API or `sudo` scope is
-required.
+`route::<target>` labels are deterministic maintainer overrides. One label
+keeps the single-target behavior above. Multiple labels, or multiple classifier
+targets at confidence 0.85 or higher, keep the intake issue in place and create
+one idempotent linked child in every selected project:
+
+- `recommend` children receive `routed` but remain dormant for a maintainer.
+- `auto_move` children receive `routed` and a completed routing event.
+- `auto_implement` children receive `routed`; their durable synthetic event
+  adds the trigger label and queues normal target-project triage exactly once.
+
+Before the first child is created, roboomp validates every target branch and
+persists the complete target set. Retry recovery uses a random per-child marker,
+does not duplicate children or source notes, and continues unfinished targets.
+Single-target move recovery still resolves GitLab's global issue ID through
+GraphQL and reads the issue through the allowlisted destination project; no
+administrator API or `sudo` scope is required.
 
 The credential-proxy—not the orchestrator—receives either the legacy token or
 the routed credential set:
@@ -159,10 +183,11 @@ target. A group hook is neither required nor used:
 - SSL verification: enabled
 
 GitLab uses `X-Gitlab-Token`; the receiver compares it in constant time.
-Re-delivery of the same event UUID is idempotent. Validate routing with one
-issue per enabled mode: a recommendation stays in intake, an automatic move
-lands in the declared target with `routed`, and automatic implementation
-creates an `issue.routed` target event with task kind `triage_issue`.
+Re-delivery of the same event UUID is idempotent. Validate routing with a
+single-target recommendation, a single automatic move, and a multi-target
+issue. The multi-target case must retain the intake issue, create exactly one
+linked child per selected project, leave `recommend` children dormant, and
+queue `auto_implement` children with task kind `triage_issue`.
 
 ### Configuration
 

@@ -52,6 +52,15 @@ services:
       ROBOMP_GITLAB_BOT_LOGINS: ${ROBOMP_GITLAB_BOT_LOGINS:-}
       ROBOMP_GITLAB_ROUTING_POLICY: ${ROBOMP_GITLAB_ROUTING_POLICY:-}
       ROBOMP_GITLAB_TRIGGER_LABEL: ${ROBOMP_GITLAB_TRIGGER_LABEL:-roboomp}
+      # Contextual routing credentials stay in the orchestrator and are
+      # scrubbed before coding-agent subprocesses start.
+      ROBOMP_ROUTING_LLM_BASE_URL: ${ROBOMP_ROUTING_LLM_BASE_URL:-https://litellm.example.com/v1}
+      ROBOMP_ROUTING_LLM_API_KEY: ${ROBOMP_ROUTING_LLM_API_KEY:-}
+      ROBOMP_ROUTING_LLM_MODEL: ${ROBOMP_ROUTING_LLM_MODEL:-local-model-mini}
+      ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS: ${ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS:-90}
+      ROBOMP_HINDSIGHT_BASE_URL: ${ROBOMP_HINDSIGHT_BASE_URL:-http://hindsight:8888}
+      ROBOMP_HINDSIGHT_API_KEY: ${ROBOMP_HINDSIGHT_API_KEY:-}
+      ROBOMP_HINDSIGHT_BANK: ${ROBOMP_HINDSIGHT_BANK:-omp}
 
       # --- PR review / vouch gate ---
       # When PRs are gated by the vouch GitHub Action, set the trigger to
