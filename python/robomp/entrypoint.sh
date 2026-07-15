@@ -65,9 +65,10 @@ fi
 if [ -e /srv/agent-home-stage/.omp/agent ]; then
     cp -a /srv/agent-home-stage/.omp/agent/. /srv/agent-home/.omp/agent/
 fi
-chown -R root:root /srv/agent-home || true
+chown -R root:root /srv/agent-home
 find /srv/agent-home -type d -exec chmod 0755 {} +
 find /srv/agent-home -type f -exec chmod 0644 {} +
+install -d -o root -g omp -m 2770 /srv/agent-home/.omp/run
 
 touch /data/robomp.sqlite
 chown root:root /data/robomp.sqlite

@@ -126,6 +126,7 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
 
 _AGENT_HOME = Path("/srv/agent-home")
 _AGENT_HOME_STAGE = Path("/srv/agent-home-stage")
+_OMP_SHARED_GID = 2000
 
 
 def _stage_agent_home() -> None:
@@ -180,6 +181,17 @@ def _stage_agent_home() -> None:
                     os.chown(path, 0, 0)
             except OSError as exc:
                 log.warning("Failed to normalize agent home file %s: %s", path, exc)
+
+    runtime_dir = _AGENT_HOME / ".omp" / "run"
+    try:
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        if chown_to_root:
+            os.chown(runtime_dir, 0, _OMP_SHARED_GID)
+            runtime_dir.chmod(0o2770)
+        else:
+            runtime_dir.chmod(0o700)
+    except OSError as exc:
+        log.warning("Failed to prepare writable OMP runtime directory %s: %s", runtime_dir, exc)
 
 
 def _build_extra_env(settings: Settings) -> dict[str, str]:

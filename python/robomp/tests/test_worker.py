@@ -8,6 +8,8 @@ whether the workspace's omp session directory already holds a JSONL transcript.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -296,6 +298,33 @@ def test_build_extra_env_stages_agent_home(tmp_path: Path, settings: Settings, m
     assert (agent_home / ".agent" / "rules" / "rule.md").stat().st_mode & 0o777 == 0o644
     assert (agent_home / ".omp" / "agent").stat().st_mode & 0o777 == 0o755
     assert (agent_home / ".omp" / "agent" / "models.yml").stat().st_mode & 0o777 == 0o644
+    runtime_dir = agent_home / ".omp" / "run"
+    expected_runtime_mode = 0o2770 if os.name == "posix" and os.geteuid() == 0 else 0o700
+    assert runtime_dir.stat().st_mode & 0o7777 == expected_runtime_mode
+
+    if os.name == "posix" and os.geteuid() == 0:
+        runtime_probe = runtime_dir / "slot-probe"
+        created = subprocess.run(
+            ["touch", str(runtime_probe)],
+            check=False,
+            user=2001,
+            group=2001,
+            extra_groups=[worker._OMP_SHARED_GID],
+        )
+        assert created.returncode == 0
+
+        config_probe = subprocess.run(
+            ["tee", "-a", str(agent_home / ".agent" / "AGENTS.md")],
+            input="injected\n",
+            text=True,
+            capture_output=True,
+            check=False,
+            user=2001,
+            group=2001,
+            extra_groups=[worker._OMP_SHARED_GID],
+        )
+        assert config_probe.returncode != 0
+        assert (agent_home / ".agent" / "AGENTS.md").read_text(encoding="utf-8") == "agent instructions\n"
 
 
 @pytest.mark.asyncio
