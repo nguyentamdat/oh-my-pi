@@ -126,20 +126,26 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
 
 _AGENT_HOME = Path("/srv/agent-home")
 _AGENT_HOME_STAGE = Path("/srv/agent-home-stage")
-_OMP_SHARED_GID = 2000
 
 
-def _stage_agent_home() -> None:
-    """Copy late-appearing staged agent config into the runtime HOME."""
+def _stage_agent_home(slot_uid: int | None = None) -> Path | None:
+    """Reset staged config into an isolated per-slot HOME and return it."""
+    target_home = _AGENT_HOME if slot_uid is None else _AGENT_HOME / "slots" / str(slot_uid)
     if not _AGENT_HOME_STAGE.exists():
-        return
+        return target_home if target_home.is_dir() else None
+    try:
+        target_home.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("Failed to create agent home %s: %s", target_home, exc)
+        return None
 
+    chown_to_root = os.geteuid() == 0
     for rel in (Path(".agent"), Path(".omp/agent")):
         src = _AGENT_HOME_STAGE / rel
         if not src.exists():
             continue
 
-        dst = _AGENT_HOME / rel
+        dst = target_home / rel
         try:
             if os.path.lexists(dst):
                 if dst.is_dir() and not dst.is_symlink():
@@ -148,53 +154,43 @@ def _stage_agent_home() -> None:
                     dst.unlink()
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src, dst, dirs_exist_ok=True)
+            for root, dirs, files in os.walk(dst):
+                root_path = Path(root)
+                root_path.chmod(0o755)
+                if chown_to_root:
+                    os.chown(root_path, 0, 0)
+                for name in dirs:
+                    path = root_path / name
+                    path.chmod(0o755)
+                    if chown_to_root:
+                        os.chown(path, 0, 0)
+                for name in files:
+                    path = root_path / name
+                    path.chmod(0o644)
+                    if chown_to_root:
+                        os.chown(path, 0, 0)
         except OSError as exc:
             log.warning("Failed to stage agent home path %s: %s", rel, exc)
 
-    if not _AGENT_HOME.exists():
-        return
-
-    chown_to_root = os.geteuid() == 0
-    for root, dirs, files in os.walk(_AGENT_HOME):
-        root_path = Path(root)
-        try:
-            root_path.chmod(0o755)
-            if chown_to_root:
-                os.chown(root_path, 0, 0)
-        except OSError as exc:
-            log.warning("Failed to normalize agent home directory %s: %s", root_path, exc)
-
-        for name in dirs:
-            path = root_path / name
-            try:
-                path.chmod(0o755)
-                if chown_to_root:
-                    os.chown(path, 0, 0)
-            except OSError as exc:
-                log.warning("Failed to normalize agent home directory %s: %s", path, exc)
-
-        for name in files:
-            path = root_path / name
-            try:
-                path.chmod(0o644)
-                if chown_to_root:
-                    os.chown(path, 0, 0)
-            except OSError as exc:
-                log.warning("Failed to normalize agent home file %s: %s", path, exc)
-
-    runtime_dir = _AGENT_HOME / ".omp" / "run"
+    runtime_dir = target_home / ".omp" / "run"
     try:
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir)
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        if chown_to_root:
-            os.chown(runtime_dir, 0, _OMP_SHARED_GID)
-            runtime_dir.chmod(0o2770)
-        else:
-            runtime_dir.chmod(0o700)
+        runtime_dir.chmod(0o700)
+        if chown_to_root and slot_uid is not None:
+            os.chown(runtime_dir, slot_uid, slot_uid)
+            os.chown(target_home, slot_uid, slot_uid)
+            target_home.chmod(0o700)
+        elif slot_uid is None:
+            target_home.chmod(0o755)
     except OSError as exc:
-        log.warning("Failed to prepare writable OMP runtime directory %s: %s", runtime_dir, exc)
+        log.warning("Failed to prepare isolated OMP runtime directory %s: %s", runtime_dir, exc)
+
+    return target_home
 
 
-def _build_extra_env(settings: Settings) -> dict[str, str]:
+def _build_extra_env(settings: Settings, slot_uid: int | None = None) -> dict[str, str]:
     """Build the env overlay passed to the omp subprocess.
 
     `omp_rpc` merges this dict on top of `os.environ`, so overlaying empty
@@ -202,10 +198,10 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     child — `del` on the parent's env would not help us here.
     """
     del settings  # kept for future hooks (model-specific env, etc.)
-    _stage_agent_home()
+    agent_home = _stage_agent_home(slot_uid)
     env = dict.fromkeys(_SCRUBBED_ENV_KEYS, "")
-    if _AGENT_HOME.is_dir():
-        env["HOME"] = str(_AGENT_HOME)
+    if agent_home is not None and agent_home.is_dir():
+        env["HOME"] = str(agent_home)
     return env
 
 
@@ -499,7 +495,7 @@ def _run_rpc_blocking(
         if isinstance(ev, dict) and ev.get("type") == "text_delta":
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
-    rpc_env = _build_extra_env(settings)
+    rpc_env = _build_extra_env(settings, inputs.slot_uid)
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
     rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
     rpc_env.update(

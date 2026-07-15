@@ -299,32 +299,61 @@ def test_build_extra_env_stages_agent_home(tmp_path: Path, settings: Settings, m
     assert (agent_home / ".omp" / "agent").stat().st_mode & 0o777 == 0o755
     assert (agent_home / ".omp" / "agent" / "models.yml").stat().st_mode & 0o777 == 0o644
     runtime_dir = agent_home / ".omp" / "run"
-    expected_runtime_mode = 0o2770 if os.name == "posix" and os.geteuid() == 0 else 0o700
-    assert runtime_dir.stat().st_mode & 0o7777 == expected_runtime_mode
+    assert runtime_dir.stat().st_mode & 0o777 == 0o700
 
-    if os.name == "posix" and os.geteuid() == 0:
-        runtime_probe = runtime_dir / "slot-probe"
-        created = subprocess.run(
-            ["touch", str(runtime_probe)],
-            check=False,
-            user=2001,
-            group=2001,
-            extra_groups=[worker._OMP_SHARED_GID],
-        )
-        assert created.returncode == 0
 
-        config_probe = subprocess.run(
-            ["tee", "-a", str(agent_home / ".agent" / "AGENTS.md")],
-            input="injected\n",
-            text=True,
-            capture_output=True,
-            check=False,
-            user=2001,
-            group=2001,
-            extra_groups=[worker._OMP_SHARED_GID],
-        )
-        assert config_probe.returncode != 0
-        assert (agent_home / ".agent" / "AGENTS.md").read_text(encoding="utf-8") == "agent instructions\n"
+def test_stage_agent_home_isolates_slot_runtime_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    if os.name != "posix" or os.geteuid() != 0:
+        pytest.skip("numeric slot ownership requires root on POSIX")
+
+    stage_home = tmp_path / "agent-home-stage"
+    agent_home = tmp_path / "agent-home"
+    monkeypatch.setattr(worker, "_AGENT_HOME_STAGE", stage_home)
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+    (stage_home / ".agent").mkdir(parents=True)
+    (stage_home / ".omp" / "agent").mkdir(parents=True)
+    (stage_home / ".agent" / "AGENTS.md").write_text("trusted\n", encoding="utf-8")
+    (stage_home / ".omp" / "agent" / "models.yml").write_text("models: []\n", encoding="utf-8")
+
+    slot_one = worker._stage_agent_home(2001)
+    slot_two = worker._stage_agent_home(2002)
+    assert slot_one is not None and slot_two is not None
+    assert slot_one != slot_two
+
+    slot_two_marker = slot_two / ".omp" / "run" / "broker.sock"
+    created = subprocess.run(
+        ["touch", str(slot_two_marker)],
+        check=False,
+        user=2002,
+        group=2002,
+    )
+    assert created.returncode == 0
+
+    cross_slot_delete = subprocess.run(
+        ["rm", str(slot_two_marker)],
+        check=False,
+        capture_output=True,
+        user=2001,
+        group=2001,
+    )
+    assert cross_slot_delete.returncode != 0
+    assert slot_two_marker.exists()
+
+    own_config_write = subprocess.run(
+        ["tee", "-a", str(slot_one / ".agent" / "AGENTS.md")],
+        input="injected\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        user=2001,
+        group=2001,
+    )
+    assert own_config_write.returncode != 0
+
+    slot_one_marker = slot_one / ".omp" / "run" / "stale"
+    slot_one_marker.touch()
+    worker._stage_agent_home(2001)
+    assert not slot_one_marker.exists()
 
 
 @pytest.mark.asyncio
