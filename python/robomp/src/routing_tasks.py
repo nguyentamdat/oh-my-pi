@@ -124,6 +124,7 @@ async def route_issue(
             policy.intake_project_id,
             issue.iid,
             decision,
+            existing_labels=issue.labels,
             require_human=True,
         )
         return RouteResult(RouteAction.NEEDS_HUMAN)
@@ -137,6 +138,7 @@ async def route_issue(
             issue.iid,
             decision,
             require_human=True,
+            existing_labels=issue.labels,
         )
         return RouteResult(RouteAction.RECOMMENDED, target)
 
@@ -484,12 +486,19 @@ async def _recommend(
     project_id: int,
     iid: int,
     decision: RouteDecision,
+    existing_labels: tuple[str, ...],
     *,
     require_human: bool,
 ) -> None:
     candidates = decision.candidates[:3]
     labels = ["needs-routing"] if require_human else []
     labels.extend(f"suggest::{candidate.key}" for candidate in candidates)
+    desired_suggestions = {f"suggest::{candidate.key}" for candidate in candidates}
+    stale_suggestions = [
+        label for label in existing_labels if label.startswith("suggest::") and label not in desired_suggestions
+    ]
+    if stale_suggestions:
+        await gitlab.remove_issue_labels(project_id, iid, stale_suggestions)
     if labels:
         await gitlab.add_issue_labels(project_id, iid, labels)
     if not candidates:

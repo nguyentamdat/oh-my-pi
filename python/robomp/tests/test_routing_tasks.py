@@ -224,12 +224,14 @@ def _event(delivery_id: str = "delivery-1") -> ForgeEvent:
 async def test_recommend_mode_records_decision_without_moving(tmp_path) -> None:
     db = Database(tmp_path / "routing.sqlite")
     gitlab = FakeGitLab()
+    gitlab.source = replace(gitlab.source, labels=("suggest::server",))
 
     result = await route_issue(event=_event(), policy=_policy("recommend"), db=db, gitlab=gitlab)
 
     assert result.action is RouteAction.RECOMMENDED
     assert gitlab.moves == []
     assert gitlab.added_labels == [(2080, 7, ("needs-routing", "suggest::protocol"))]
+    assert gitlab.removed_labels == [(2080, 7, ("suggest::server",))]
     decisions = db.list_routing_decisions("gitlab-zingplay:2080:issue:7")
     assert [(decision.action, decision.selected_project_id) for decision in decisions] == [("recommended", "357")]
 
