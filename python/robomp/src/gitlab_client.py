@@ -9,6 +9,15 @@ from urllib.parse import urlparse
 
 import httpx
 
+_RESOLVE_MOVED_ISSUE_QUERY = """
+query ResolveMovedIssue($id: IssueID!) {
+  issue(id: $id) {
+    iid
+    projectId
+  }
+}
+""".strip()
+
 
 class GitLabError(RuntimeError):
     """Raised when GitLab returns a non-success response."""
@@ -245,15 +254,31 @@ class GitLabClient:
         source_issue = await self.get_issue(source_project_id, iid)
         if source_issue.moved_to_id is None:
             return None
-        data = await self.request("GET", f"issues/{source_issue.moved_to_id}")
-        if not isinstance(data, Mapping):
-            raise ValueError("GitLab moved issue response must be an object")
-        returned_project_id = data.get("project_id")
+        response = await self.request(
+            "POST",
+            f"{self._api_url.removesuffix('/v4')}/graphql",
+            json={
+                "query": _RESOLVE_MOVED_ISSUE_QUERY,
+                "variables": {"id": f"gid://gitlab/Issue/{source_issue.moved_to_id}"},
+            },
+        )
+        payload = response.get("data") if isinstance(response, Mapping) else None
+        moved_issue = payload.get("issue") if isinstance(payload, Mapping) else None
+        if not isinstance(moved_issue, Mapping):
+            raise ValueError("GitLab moved issue GraphQL response must contain an issue")
+        returned_project_id = moved_issue.get("projectId")
         if not _project_id(returned_project_id):
             raise ValueError("GitLab moved issue response has an invalid project_id")
         if returned_project_id != expected_target_project_id:
             raise ValueError("GitLab moved issue response did not match expected target project")
-        return _issue_from_payload(returned_project_id, data)
+        try:
+            target_iid = _iid(int(moved_issue["iid"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("GitLab moved issue response has an invalid iid") from exc
+        target_issue = await self.get_issue(returned_project_id, target_iid)
+        if target_issue.id != source_issue.moved_to_id:
+            raise ValueError("GitLab moved issue response did not match moved_to_id")
+        return target_issue
 
     async def create_merge_request(
         self,

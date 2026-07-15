@@ -215,7 +215,7 @@ async def test_move_issue_posts_target_project_and_returns_target_issue() -> Non
 
 
 @pytest.mark.asyncio
-async def test_resolve_moved_issue_reads_source_then_global_target() -> None:
+async def test_resolve_moved_issue_reads_graphql_identity_then_target_issue() -> None:
     target_project_id = 357
     calls: list[str] = []
 
@@ -225,9 +225,13 @@ async def test_resolve_moved_issue_reads_source_then_global_target() -> None:
             source = _issue()
             source.update({"id": 100, "moved_to_id": 200})
             return httpx.Response(200, json=source)
-        if request.url.path == "/api/v4/issues/200":
+        if request.url.path == "/api/graphql":
+            assert request.method == "POST"
+            assert json.loads(request.content)["variables"] == {"id": "gid://gitlab/Issue/200"}
+            return httpx.Response(200, json={"data": {"issue": {"iid": "99", "projectId": target_project_id}}})
+        if request.url.path == f"/api/v4/projects/{target_project_id}/issues/99":
             target = _issue(iid=99)
-            target.update({"id": 200, "project_id": target_project_id})
+            target.update({"id": 200})
             return httpx.Response(200, json=target)
         if request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues/43":
             source = _issue(iid=43)
@@ -250,7 +254,8 @@ async def test_resolve_moved_issue_reads_source_then_global_target() -> None:
     assert await client.resolve_moved_issue(PROJECT_ID, 43, target_project_id) is None
     assert calls == [
         f"/api/v4/projects/{PROJECT_ID}/issues/42",
-        "/api/v4/issues/200",
+        "/api/graphql",
+        f"/api/v4/projects/{target_project_id}/issues/99",
         f"/api/v4/projects/{PROJECT_ID}/issues/43",
     ]
 
@@ -264,10 +269,8 @@ async def test_resolve_moved_issue_rejects_unexpected_target_project() -> None:
             source = _issue()
             source.update({"id": 100, "moved_to_id": 200})
             return httpx.Response(200, json=source)
-        if request.url.path == "/api/v4/issues/200":
-            target = _issue(iid=99)
-            target.update({"id": 200, "project_id": 358})
-            return httpx.Response(200, json=target)
+        if request.url.path == "/api/graphql":
+            return httpx.Response(200, json={"data": {"issue": {"iid": "99", "projectId": 358}}})
         raise AssertionError(f"unexpected route {request.url.path}")
 
     client = GitLabClient(

@@ -296,10 +296,12 @@ async def test_move_and_recovery_use_routing_token_and_validate_both_projects(tm
             return httpx.Response(200, json=issue_payload(iid=99, issue_id=200))
         if request.url.path == f"/api/v4/projects/{source_project_id}/issues/7":
             return httpx.Response(200, json=issue_payload(iid=7, issue_id=100, moved_to_id=200))
-        if request.url.path == "/api/v4/issues/200":
-            payload = issue_payload(iid=99, issue_id=200)
-            payload["project_id"] = target_project_id
-            return httpx.Response(200, json=payload)
+        if request.url.path == "/api/graphql":
+            assert isinstance(body, dict)
+            assert body["variables"] == {"id": "gid://gitlab/Issue/200"}
+            return httpx.Response(200, json={"data": {"issue": {"iid": "99", "projectId": target_project_id}}})
+        if request.url.path == f"/api/v4/projects/{target_project_id}/issues/99":
+            return httpx.Response(200, json=issue_payload(iid=99, issue_id=200))
         if request.url.path == f"/api/v4/projects/{source_project_id}/issues/8":
             return httpx.Response(200, json=issue_payload(iid=8, issue_id=101))
         raise AssertionError(f"unexpected route {request.url.path}")
@@ -326,11 +328,12 @@ async def test_move_and_recovery_use_routing_token_and_validate_both_projects(tm
     assert recovered is not None
     assert recovered.project_id == target_project_id
     assert recovered.id == 200
-    assert seen == [
-        (f"/api/v4/projects/{source_project_id}/issues/7/move", routing_token, {"to_project_id": target_project_id}),
-        (f"/api/v4/projects/{source_project_id}/issues/7", routing_token, None),
-        ("/api/v4/issues/200", routing_token, None),
-        (f"/api/v4/projects/{source_project_id}/issues/8", routing_token, None),
+    assert [(path, token) for path, token, _body in seen] == [
+        (f"/api/v4/projects/{source_project_id}/issues/7/move", routing_token),
+        (f"/api/v4/projects/{source_project_id}/issues/7", routing_token),
+        ("/api/graphql", routing_token),
+        (f"/api/v4/projects/{target_project_id}/issues/99", routing_token),
+        (f"/api/v4/projects/{source_project_id}/issues/8", routing_token),
     ]
 
     async with await _client(app) as client:
@@ -356,7 +359,7 @@ async def test_move_and_recovery_use_routing_token_and_validate_both_projects(tm
         )
     assert disallowed_target.status_code == 403
     assert disallowed_source.status_code == 403
-    assert len(seen) == 4
+    assert len(seen) == 5
 
 
 async def test_move_error_scrubs_every_configured_gitlab_token(tmp_path: Path) -> None:
