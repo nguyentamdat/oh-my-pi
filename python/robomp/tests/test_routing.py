@@ -191,6 +191,8 @@ def test_settings_parses_policy_and_rejects_malformed_policy(
     monkeypatch.setenv("ROBOMP_GITLAB_BOT_LOGIN", "routing-bot")
     monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "100,200,300")
     monkeypatch.setenv("ROBOMP_GITLAB_ROUTING_POLICY", json.dumps(_policy_data()))
+    monkeypatch.setenv("ROBOMP_ROUTING_LLM_API_KEY", "routing-llm-secret")
+    monkeypatch.setenv("ROBOMP_HINDSIGHT_API_KEY", "hindsight-secret")
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
 

@@ -17,6 +17,7 @@ from robomp.db import Database, EventRow
 from robomp.forge import ForgeEvent
 from robomp.github_backend import GitHubBackend
 from robomp.gitlab_backend import GitLabBackend
+from robomp.routing_llm import RoutingLLMClassifier
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 
@@ -43,6 +44,7 @@ class WorkerPool:
         github: GitHubBackend,
         sandbox: SandboxManager,
         git_transport: GitTransport,
+        routing_classifier: RoutingLLMClassifier | None = None,
         slot_pool: SlotPool | None = None,
         forge_runtime_factories: Mapping[str, Callable[[EventRow], ForgeRuntime]] | None = None,
     ) -> None:
@@ -51,6 +53,7 @@ class WorkerPool:
         self.github = github
         self.sandbox = sandbox
         self.git_transport = git_transport
+        self.routing_classifier = routing_classifier
         self.forge_runtime_factories = dict(forge_runtime_factories or {})
         self._workers: list[asyncio.Task[None]] = []
         self._wakeup = asyncio.Event()
@@ -394,6 +397,7 @@ class WorkerPool:
                 policy=policy,
                 db=self.db,
                 gitlab=runtime.routing_backend,
+                classifier=self.routing_classifier,
             )
             if outcome.target_event_queued:
                 self.wake()

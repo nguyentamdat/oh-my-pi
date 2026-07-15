@@ -7,7 +7,7 @@ import pytest
 from robomp.db import Database
 from robomp.forge import Actor, ForgeEvent, RepositoryRef, WorkItemRef
 from robomp.gitlab_client import GitLabIssueInfo, GitLabNoteInfo, GitLabProjectInfo
-from robomp.routing import RoutingPolicy
+from robomp.routing import RouteCandidate, RouteDecision, RoutingPolicy
 from robomp.routing_tasks import RouteAction, apply_target_routing, route_issue
 
 
@@ -219,3 +219,69 @@ async def test_incomplete_intent_reconciles_without_reclassifying_source(tmp_pat
     assert gitlab.get_issue_calls == 0
     assert gitlab.moves == []
     assert db.resolve_routing_lineage(event.item.key) is not None
+
+
+class FakeClassifier:
+    def __init__(self, decision: RouteDecision) -> None:
+        self.decision = decision
+        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    async def classify(self, title: str, body: str, paths=()) -> RouteDecision:
+        self.calls.append((title, body, tuple(paths)))
+        return self.decision
+
+
+@pytest.mark.asyncio
+async def test_llm_classifier_routes_issue_without_deterministic_keyword_match(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(gitlab.source, title="Lỗi hiển thị vật phẩm", description="Không rõ component")
+    policy = _policy("auto_move")
+    target = policy.targets[0]
+    candidate = RouteCandidate(
+        target=target,
+        score=91,
+        confidence=0.91,
+        paths=(),
+        aliases=(),
+        signals=("ownership context",),
+    )
+    classifier = FakeClassifier(RouteDecision(target=target, confidence=0.91, candidates=(candidate,), explicit=False))
+
+    result = await route_issue(
+        event=_event(),
+        policy=policy,
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.MOVED
+    assert gitlab.moves == [(2080, 7, 357)]
+    assert classifier.calls == [("Lỗi hiển thị vật phẩm", "Không rõ component", ())]
+
+
+@pytest.mark.asyncio
+async def test_explicit_route_override_skips_llm_classifier(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(
+        gitlab.source,
+        title="Không có keyword",
+        description="",
+        labels=("route::protocol",),
+    )
+    classifier = FakeClassifier(RouteDecision(target=None, confidence=0.0, candidates=()))
+
+    result = await route_issue(
+        event=_event(),
+        policy=_policy("auto_move"),
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.MOVED
+    assert classifier.calls == []
+    decisions = db.list_routing_decisions("gitlab-zingplay:2080:issue:7")
+    assert decisions[-1].explicit

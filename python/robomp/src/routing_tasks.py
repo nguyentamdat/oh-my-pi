@@ -11,6 +11,7 @@ from robomp.forge import ForgeEvent, RepositoryRef, WorkItemRef
 from robomp.gitlab_backend import GitLabBackend
 from robomp.gitlab_client import GitLabIssueInfo
 from robomp.routing import AUTO_ROUTE_CONFIDENCE, RouteDecision, RouteTarget, RoutingMode, RoutingPolicy
+from robomp.routing_llm import RoutingLLMClassifier
 
 _PATH_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+")
 
@@ -38,6 +39,7 @@ async def route_issue(
     policy: RoutingPolicy,
     db: Database,
     gitlab: GitLabBackend,
+    classifier: RoutingLLMClassifier | None = None,
 ) -> RouteResult:
     """Classify one intake issue, then recommend, move, or enqueue implementation."""
     if event.item.repository.remote_id != str(policy.intake_project_id):
@@ -73,12 +75,10 @@ async def route_issue(
         )
 
     issue = await gitlab.get_issue(policy.intake_project_id, event.item.number)
-    decision = policy.classify(
-        issue.title,
-        issue.description,
-        issue.labels,
-        _extract_paths(issue.title, issue.description),
-    )
+    paths = _extract_paths(issue.title, issue.description)
+    decision = policy.classify(issue.title, issue.description, issue.labels, paths)
+    if classifier is not None and not decision.explicit:
+        decision = await classifier.classify(issue.title, issue.description, paths)
     if decision.target is None:
         _record_decision(db, event, decision, RouteAction.NEEDS_HUMAN)
         await _recommend(

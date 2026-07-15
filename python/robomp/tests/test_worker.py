@@ -266,6 +266,8 @@ async def test_run_rpc_omits_continue_when_session_empty(
     assert client_kwargs["env"]["ROBOMP_GITLAB_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_REPLAY_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
+    assert client_kwargs["env"]["ROBOMP_ROUTING_LLM_API_KEY"] == ""
+    assert client_kwargs["env"]["ROBOMP_HINDSIGHT_API_KEY"] == ""
     assert client_kwargs["user"] is None
     assert client_kwargs["group"] is None
     assert client_kwargs["extra_groups"] is None
@@ -382,6 +384,8 @@ async def test_run_rpc_omits_home_when_agent_home_absent(
     assert client_kwargs["env"]["ROBOMP_GITLAB_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_REPLAY_TOKEN"] == ""
     assert client_kwargs["env"]["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
+    assert client_kwargs["env"]["ROBOMP_ROUTING_LLM_API_KEY"] == ""
+    assert client_kwargs["env"]["ROBOMP_HINDSIGHT_API_KEY"] == ""
 
 
 @pytest.mark.asyncio

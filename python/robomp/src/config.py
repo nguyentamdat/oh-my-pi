@@ -64,6 +64,22 @@ class Settings(BaseSettings):
     # Optional cross-project issue routing policy. Parsed and validated at
     # startup so a malformed operator policy cannot reach webhook handling.
     gitlab_routing_policy_raw: str = Field("", alias="ROBOMP_GITLAB_ROUTING_POLICY")
+    # Intake routing uses a local OpenAI-compatible model plus bounded
+    # Hindsight recall. Both credentials stay in the orchestrator and are
+    # scrubbed from every coding-agent subprocess.
+    routing_llm_base_url: str = Field(
+        "https://litellm.zingplay.com/v1",
+        alias="ROBOMP_ROUTING_LLM_BASE_URL",
+    )
+    routing_llm_api_key: SecretStr | None = Field(None, alias="ROBOMP_ROUTING_LLM_API_KEY")
+    routing_llm_model: str = Field("local-model-mini", alias="ROBOMP_ROUTING_LLM_MODEL")
+    routing_llm_timeout_seconds: float = Field(30.0, gt=0, alias="ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS")
+    hindsight_base_url: str = Field(
+        "http://hindsight.apps.svc.cluster.local:8888",
+        alias="ROBOMP_HINDSIGHT_BASE_URL",
+    )
+    hindsight_api_key: SecretStr | None = Field(None, alias="ROBOMP_HINDSIGHT_API_KEY")
+    hindsight_bank: str = Field("omp", alias="ROBOMP_HINDSIGHT_BANK")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
     # PR review trigger. "open" (default) reviews incoming PRs on
     # opened/reopened/ready_for_review. "vouched_label" DEFERS review until the
@@ -358,6 +374,10 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(
                 f"ROBOMP_GITLAB_PROJECT_IDS must include the routing intake and every target; missing {missing}"
+            )
+        if self.routing_llm_api_key is None or self.hindsight_api_key is None:
+            raise ValueError(
+                "ROBOMP_ROUTING_LLM_API_KEY and ROBOMP_HINDSIGHT_API_KEY must be set when GitLab routing is enabled."
             )
         return self
 

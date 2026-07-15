@@ -46,6 +46,7 @@ from robomp.manual_triage import (
 from robomp.natives_cache import NativesCache
 from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
 from robomp.queue import ForgeRuntime, WorkerPool
+from robomp.routing_llm import RoutingLLMClassifier
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
@@ -395,12 +396,28 @@ def _build_state(
         transport=git_transport,
         natives_cache=natives_cache,
     )
+    routing_policy = settings.gitlab_routing_policy
+    routing_classifier: RoutingLLMClassifier | None = None
+    if routing_policy is not None:
+        assert settings.routing_llm_api_key is not None
+        assert settings.hindsight_api_key is not None
+        routing_classifier = RoutingLLMClassifier(
+            policy=routing_policy,
+            llm_base_url=settings.routing_llm_base_url,
+            llm_api_key=settings.routing_llm_api_key.get_secret_value(),
+            llm_model=settings.routing_llm_model,
+            hindsight_base_url=settings.hindsight_base_url,
+            hindsight_api_key=settings.hindsight_api_key.get_secret_value(),
+            hindsight_bank=settings.hindsight_bank,
+            timeout_seconds=settings.routing_llm_timeout_seconds,
+        )
     pool = WorkerPool(
         settings=settings,
         db=db,
         github=github,
         sandbox=sandbox,
         git_transport=git_transport,
+        routing_classifier=routing_classifier,
         forge_runtime_factories=_build_forge_runtime_factories(
             settings,
             natives_cache=natives_cache,
@@ -414,6 +431,7 @@ def _build_state(
         "git_transport": git_transport,
         "sandbox": sandbox,
         "natives_cache": natives_cache,
+        "routing_classifier": routing_classifier,
         "pool": pool,
         "issue_browse_cache": _IssueBrowseCache(),
         "webhook_adapters": _build_webhook_adapters(settings, webhook_adapters),
@@ -442,10 +460,15 @@ def create_app(
             yield
         finally:
             await autoclose.stop()
-            await pool.stop(
-                drain_timeout=cfg.shutdown_drain_timeout_seconds,
-                kill_timeout=cfg.shutdown_kill_timeout_seconds,
-            )
+            try:
+                await pool.stop(
+                    drain_timeout=cfg.shutdown_drain_timeout_seconds,
+                    kill_timeout=cfg.shutdown_kill_timeout_seconds,
+                )
+            finally:
+                routing_classifier: RoutingLLMClassifier | None = app.state.bag["routing_classifier"]
+                if routing_classifier is not None:
+                    await routing_classifier.aclose()
 
     app = FastAPI(title="robomp", version="0.1.0", lifespan=lifespan)
 

@@ -875,6 +875,8 @@ def _gitlab_routing_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str
             }
         ),
     )
+    monkeypatch.setenv("ROBOMP_ROUTING_LLM_API_KEY", "routing-llm-secret")
+    monkeypatch.setenv("ROBOMP_HINDSIGHT_API_KEY", "hindsight-secret")
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()

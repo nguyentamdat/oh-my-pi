@@ -122,6 +122,8 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "ROBOMP_GITLAB_TOKEN",
     "ROBOMP_REPLAY_TOKEN",
     "ROBOMP_GH_PROXY_HMAC_KEY",
+    "ROBOMP_ROUTING_LLM_API_KEY",
+    "ROBOMP_HINDSIGHT_API_KEY",
 )
 
 _AGENT_HOME = Path("/srv/agent-home")
