@@ -285,3 +285,26 @@ async def test_explicit_route_override_skips_llm_classifier(tmp_path) -> None:
     assert classifier.calls == []
     decisions = db.list_routing_decisions("gitlab-zingplay:2080:issue:7")
     assert decisions[-1].explicit
+
+
+@pytest.mark.asyncio
+async def test_deterministic_target_match_skips_llm_classifier(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(
+        gitlab.source,
+        title="Protocol packet protobuf response field",
+        description="",
+    )
+    classifier = FakeClassifier(RouteDecision(target=None, confidence=0.0, candidates=()))
+
+    result = await route_issue(
+        event=_event(),
+        policy=_policy("auto_move"),
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.MOVED
+    assert classifier.calls == []

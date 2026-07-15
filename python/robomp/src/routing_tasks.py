@@ -77,7 +77,7 @@ async def route_issue(
     issue = await gitlab.get_issue(policy.intake_project_id, event.item.number)
     paths = _extract_paths(issue.title, issue.description)
     decision = policy.classify(issue.title, issue.description, issue.labels, paths)
-    if classifier is not None and not decision.explicit:
+    if classifier is not None and not decision.explicit and decision.target is None:
         decision = await classifier.classify(issue.title, issue.description, paths)
     if decision.target is None:
         _record_decision(db, event, decision, RouteAction.NEEDS_HUMAN)
