@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     )
     routing_llm_api_key: SecretStr | None = Field(None, alias="ROBOMP_ROUTING_LLM_API_KEY")
     routing_llm_model: str = Field("local-model-mini", alias="ROBOMP_ROUTING_LLM_MODEL")
-    routing_llm_timeout_seconds: float = Field(30.0, gt=0, alias="ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS")
+    routing_llm_timeout_seconds: float = Field(90.0, gt=0, alias="ROBOMP_ROUTING_LLM_TIMEOUT_SECONDS")
     hindsight_base_url: str = Field(
         "http://hindsight.apps.svc.cluster.local:8888",
         alias="ROBOMP_HINDSIGHT_BASE_URL",

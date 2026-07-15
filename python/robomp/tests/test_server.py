@@ -939,20 +939,26 @@ def _gitlab_intake_issue_body(
 
 
 def _gitlab_target_issue_body(*, action: str) -> bytes:
-    return json.dumps(
-        {
-            "object_kind": "issue",
-            "project": {"id": 357, "path_with_namespace": "ica/protocol"},
-            "user": {"id": 7, "username": "alice"},
-            "object_attributes": {
-                "iid": 11,
-                "action": action,
-                "title": "Protocol packet schema is wrong",
-                "description": "Update protocol/login.proto response field",
-            },
-            "labels": [{"title": "roboomp"}],
+    payload = {
+        "object_kind": "issue",
+        "project": {"id": 357, "path_with_namespace": "ica/protocol"},
+        "user": {"id": 7, "username": "alice"},
+        "object_attributes": {
+            "iid": 11,
+            "action": action,
+            "title": "Protocol packet schema is wrong",
+            "description": "Update protocol/login.proto response field",
+        },
+        "labels": [{"title": "roboomp"}],
+    }
+    if action == "update":
+        payload["changes"] = {
+            "labels": {
+                "previous": [],
+                "current": [{"title": "roboomp"}],
+            }
         }
-    ).encode()
+    return json.dumps(payload).encode()
 
 
 def test_gitlab_runtime_factory_wires_cross_project_routing_backend(
@@ -1013,7 +1019,7 @@ def test_gitlab_intake_webhook_enqueues_route_without_trigger_label(
     assert event.canonical_key == "gitlab-zingplay:2080:issue:7"
 
 
-def test_routed_target_dedupes_only_pending_synthetic_event(
+def test_routed_target_dedupes_activation_echoes_but_allows_reopen(
     monkeypatch: pytest.MonkeyPatch,
     env: dict[str, str],
 ) -> None:
@@ -1065,6 +1071,16 @@ def test_routed_target_dedupes_only_pending_synthetic_event(
             headers={**headers, "X-Gitlab-Event-UUID": "target-move-echo"},
         )
         db.mark_event(target_event.delivery_id, "done", instance_id="gitlab-zingplay")
+        delayed = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_target_issue_body(action="update"),
+            headers={**headers, "X-Gitlab-Event-UUID": "target-delayed-label-echo"},
+        )
+        repeated = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_target_issue_body(action="update"),
+            headers={**headers, "X-Gitlab-Event-UUID": "target-repeated-label-echo"},
+        )
         retrigger = client.post(
             "/webhook/gitlab-zingplay",
             content=_gitlab_target_issue_body(action="reopen"),
@@ -1072,7 +1088,63 @@ def test_routed_target_dedupes_only_pending_synthetic_event(
         )
 
     assert pending.json()["state"] == "skipped"
+    assert delayed.json()["state"] == "skipped"
+    assert repeated.json()["state"] == "skipped"
     assert retrigger.json()["state"] == "queued"
+
+
+def test_recommended_routed_child_allows_later_manual_activation(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    cfg = _gitlab_routing_settings(monkeypatch, env)
+    app = create_app(cfg)
+    target_event = ForgeEvent(
+        delivery_id="route:intake-source:357:11",
+        source_event="RoboOMP Route",
+        event="issue.routed",
+        task_kind="routing_complete",
+        item=WorkItemRef(
+            repository=RepositoryRef(
+                instance_id="gitlab-zingplay",
+                remote_id="357",
+                full_name="ica/protocol",
+            ),
+            kind="issue",
+            number=11,
+        ),
+        actor=Actor(remote_id="7", login="alice"),
+        labels=("routed",),
+    )
+    with TestClient(app) as client:
+        db = get_database(cfg.sqlite_path)
+        db.begin_routing_intent("gitlab-zingplay:2080:issue:7", 357)
+        db.complete_routing_intent_event(
+            source_canonical_key="gitlab-zingplay:2080:issue:7",
+            target_delivery_id=target_event.delivery_id,
+            target_event_type=target_event.source_event,
+            target_repo=target_event.item.repository.full_name,
+            target_issue_key=target_event.item.key,
+            target_payload=target_event.to_dict(),
+            target_repository_id=target_event.item.repository.remote_id,
+            target_item_kind=target_event.item.kind,
+            target_item_number=target_event.item.number,
+            target_canonical_event=target_event.event,
+            target_task_kind=target_event.task_kind,
+            target_instance_id=target_event.item.repository.instance_id,
+        )
+        response = client.post(
+            "/webhook/gitlab-zingplay",
+            content=_gitlab_target_issue_body(action="update"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitlab-Token": "test-gitlab-webhook-secret",
+                "X-Gitlab-Event": "Issue Hook",
+                "X-Gitlab-Event-UUID": "target-manual-activation",
+            },
+        )
+
+    assert response.json()["state"] == "queued"
 
 
 def test_gitlab_intake_ignores_every_configured_project_bot(

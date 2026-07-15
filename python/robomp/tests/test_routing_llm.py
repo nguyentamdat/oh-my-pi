@@ -86,9 +86,13 @@ async def test_classifier_feeds_bounded_omp_recall_and_selects_allowlisted_targe
                             "message": {
                                 "content": json.dumps(
                                     {
-                                        "target_key": "client",
-                                        "confidence": 0.92,
-                                        "evidence": ["skin inventory", "project:client"],
+                                        "targets": [
+                                            {
+                                                "target_key": "client",
+                                                "confidence": 0.92,
+                                                "issue_quotes": ["Skin inventory"],
+                                            }
+                                        ]
                                     }
                                 )
                             }
@@ -118,7 +122,7 @@ async def test_classifier_feeds_bounded_omp_recall_and_selects_allowlisted_targe
     assert decision.target.key == "client"
     assert decision.confidence == 0.92
     assert decision.auto_route
-    assert decision.candidates[0].signals == ("skin inventory", "project:client")
+    assert decision.candidates[0].signals == ("Skin inventory",)
     assert len(requests) == 2
 
 
@@ -127,9 +131,18 @@ async def test_classifier_feeds_bounded_omp_recall_and_selects_allowlisted_targe
     ("content", "candidate_count"),
     [
         ("not-json", 0),
-        (json.dumps({"target_key": "unknown", "confidence": 1.0, "evidence": []}), 0),
-        (json.dumps({"target_key": "client", "confidence": 0.5, "evidence": ["weak"]}), 1),
-        (json.dumps({"target_key": "client", "confidence": 0.95, "evidence": ["project:client"]}), 1),
+        (
+            json.dumps({"targets": [{"target_key": "unknown", "confidence": 1.0, "issue_quotes": ["Unclear"]}]}),
+            0,
+        ),
+        (
+            json.dumps({"targets": [{"target_key": "client", "confidence": 0.5, "issue_quotes": ["Unclear"]}]}),
+            1,
+        ),
+        (
+            json.dumps({"targets": [{"target_key": "client", "confidence": 0.95, "issue_quotes": ["project:client"]}]}),
+            1,
+        ),
     ],
 )
 async def test_classifier_fails_closed_for_invalid_or_low_confidence_output(content: str, candidate_count: int) -> None:
@@ -156,3 +169,40 @@ async def test_classifier_fails_closed_for_invalid_or_low_confidence_output(cont
 
     assert decision.target is None
     assert len(decision.candidates) == candidate_count
+
+
+@pytest.mark.asyncio
+async def test_classifier_returns_multiple_grounded_targets_without_selecting_one() -> None:
+    content = json.dumps(
+        {
+            "targets": [
+                {"target_key": "client", "confidence": 0.9, "issue_quotes": ["client"]},
+                {"target_key": "tools", "confidence": 0.88, "issue_quotes": ["tools"]},
+            ]
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/memories/recall"):
+            return httpx.Response(200, json={"results": []})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    classifier = RoutingLLMClassifier(
+        policy=_policy(),
+        llm_base_url="https://llm.example/v1",
+        llm_api_key="llm-secret",
+        llm_model="local-model-mini",
+        hindsight_base_url="https://hindsight.example",
+        hindsight_api_key="hindsight-secret",
+        hindsight_bank="omp",
+        timeout_seconds=1,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        decision = await classifier.classify("client and tools both need changes", "")
+    finally:
+        await classifier.aclose()
+
+    assert decision.target is None
+    assert [candidate.key for candidate in decision.candidates] == ["client", "tools"]
+    assert all(candidate.confidence >= 0.85 for candidate in decision.candidates)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator, Mapping
@@ -84,6 +85,24 @@ CREATE TABLE IF NOT EXISTS routing_intents (
 );
 CREATE INDEX IF NOT EXISTS routing_intents_incomplete
   ON routing_intents(created_at)
+  WHERE target_canonical_key IS NULL;
+
+CREATE TABLE IF NOT EXISTS routing_children (
+  source_canonical_key TEXT NOT NULL,
+  target_project_id    TEXT NOT NULL,
+  mode                 TEXT NOT NULL,
+  idempotency_token   TEXT NOT NULL,
+  target_canonical_key TEXT,
+  target_delivery_id   TEXT,
+  created_at           TEXT NOT NULL,
+  completed_at         TEXT,
+  PRIMARY KEY (source_canonical_key, target_project_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS routing_children_target_canonical_key
+  ON routing_children(target_canonical_key)
+  WHERE target_canonical_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS routing_children_incomplete
+  ON routing_children(created_at)
   WHERE target_canonical_key IS NULL;
 
 CREATE TABLE IF NOT EXISTS routing_decisions (
@@ -224,6 +243,20 @@ class RoutingIntentRow:
     source_canonical_key: str
     target_project_id: str
     target_canonical_key: str | None
+    created_at: str
+    completed_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class RoutingChildRow:
+    """One durable child issue created by a multi-project route."""
+
+    source_canonical_key: str
+    target_project_id: str
+    idempotency_token: str
+    mode: str
+    target_canonical_key: str | None
+    target_delivery_id: str | None
     created_at: str
     completed_at: str | None
 
@@ -521,6 +554,29 @@ class Database:
         issue_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "classification" not in issue_cols:
             self._conn.execute("ALTER TABLE issues ADD COLUMN classification TEXT")
+        routing_child_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(routing_children)").fetchall()}
+        if "idempotency_token" not in routing_child_cols:
+            self._conn.execute("ALTER TABLE routing_children ADD COLUMN idempotency_token TEXT")
+        incomplete_tokens = self._conn.execute(
+            "SELECT source_canonical_key, target_project_id FROM routing_children WHERE idempotency_token IS NULL"
+        ).fetchall()
+        for row in incomplete_tokens:
+            self._conn.execute(
+                """
+                UPDATE routing_children
+                SET idempotency_token=?
+                WHERE source_canonical_key=? AND target_project_id=?
+                """,
+                (
+                    f"legacy:{row['source_canonical_key']}:{row['target_project_id']}",
+                    row["source_canonical_key"],
+                    row["target_project_id"],
+                ),
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS routing_children_idempotency_token "
+            "ON routing_children(idempotency_token)"
+        )
         self._migrate_events()
         self._conn.execute("CREATE INDEX IF NOT EXISTS events_item_state ON events(canonical_key, state)")
 
@@ -995,7 +1051,31 @@ class Database:
 
     def is_routed_target(self, target_canonical_key: str) -> bool:
         """Whether ingress/dispatch should treat a canonical target as routed."""
-        return self.resolve_routed_target(target_canonical_key) is not None
+        if self.resolve_routed_target(target_canonical_key) is not None:
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM routing_children
+                WHERE target_canonical_key=?
+                LIMIT 1
+                """,
+                (target_canonical_key,),
+            ).fetchone()
+        return row is not None
+
+    def has_synthetic_routing_event(self, target_canonical_key: str) -> bool:
+        """Whether a routed target has its durable synthetic activation event."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM events
+                WHERE canonical_key=? AND delivery_id LIKE 'route:%' AND task_kind='triage_issue'
+                LIMIT 1
+                """,
+                (target_canonical_key,),
+            ).fetchone()
+        return row is not None
 
     def _persist_routing_lineage_event(
         self,
@@ -1263,6 +1343,186 @@ class Database:
                 target_instance_id=target_instance_id,
                 now=now,
             )
+
+    def plan_routing_children(
+        self,
+        source_canonical_key: str,
+        targets: Iterable[tuple[str | int, str]],
+    ) -> list[RoutingChildRow]:
+        """Atomically persist the complete child target set before remote creates."""
+        if not source_canonical_key:
+            raise ValueError("routing child source is required")
+        planned: dict[str, str] = {}
+        for target_project_id, mode in targets:
+            if isinstance(target_project_id, bool) or not mode:
+                raise ValueError("routing child target project and mode are required")
+            project_id = str(target_project_id)
+            if not project_id or project_id in planned:
+                raise ValueError("routing child targets must be non-empty and unique")
+            planned[project_id] = mode
+        if not planned:
+            raise ValueError("at least one routing child target is required")
+        now = _utcnow()
+        with self._txn() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, mode, idempotency_token,
+                       target_canonical_key, target_delivery_id, created_at, completed_at
+                FROM routing_children
+                WHERE source_canonical_key=?
+                ORDER BY target_project_id
+                """,
+                (source_canonical_key,),
+            ).fetchall()
+            if rows:
+                existing = {row["target_project_id"]: row["mode"] for row in rows}
+                if existing != planned:
+                    raise ValueError("routing child plan conflicts with the existing target set")
+            else:
+                conn.executemany(
+                    """
+                    INSERT INTO routing_children (
+                      source_canonical_key, target_project_id, mode, idempotency_token, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (source_canonical_key, project_id, mode, secrets.token_hex(24), now)
+                        for project_id, mode in planned.items()
+                    ),
+                )
+                rows = conn.execute(
+                    """
+                    SELECT source_canonical_key, target_project_id, mode, idempotency_token,
+                           target_canonical_key, target_delivery_id, created_at, completed_at
+                    FROM routing_children
+                    WHERE source_canonical_key=?
+                    ORDER BY target_project_id
+                    """,
+                    (source_canonical_key,),
+                ).fetchall()
+        return [RoutingChildRow(**dict(row)) for row in rows]
+
+    def list_routing_children(self, source_canonical_key: str) -> list[RoutingChildRow]:
+        """Return every planned or completed child for a source issue."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, mode, idempotency_token,
+                       target_canonical_key, target_delivery_id, created_at, completed_at
+                FROM routing_children
+                WHERE source_canonical_key=?
+                ORDER BY target_project_id
+                """,
+                (source_canonical_key,),
+            ).fetchall()
+        return [RoutingChildRow(**dict(row)) for row in rows]
+
+    def complete_routing_child_event(
+        self,
+        *,
+        source_canonical_key: str,
+        target_project_id: str | int,
+        target_delivery_id: str,
+        target_event_type: str,
+        target_repo: str | None,
+        target_issue_key: str | None,
+        target_payload: Mapping[str, Any],
+        target_item_kind: str,
+        target_item_number: int,
+        target_canonical_event: str | None = None,
+        target_task_kind: str | None = None,
+        target_instance_id: str = DEFAULT_GITHUB_INSTANCE,
+    ) -> RoutingChildRow:
+        """Complete one child and atomically queue its synthetic target event."""
+        project_id = str(target_project_id)
+        target_canonical_key = canonical_item_key(
+            target_instance_id,
+            project_id,
+            target_item_kind,
+            target_item_number,
+        )
+        now = _utcnow()
+        with self._txn() as conn:
+            row = conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, mode, idempotency_token,
+                       target_canonical_key, target_delivery_id, created_at, completed_at
+                FROM routing_children
+                WHERE source_canonical_key=? AND target_project_id=?
+                """,
+                (source_canonical_key, project_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("routing child intent not found")
+            if row["target_canonical_key"] not in (None, target_canonical_key):
+                raise ValueError("routing child conflict: target identity changed")
+            if row["target_delivery_id"] not in (None, target_delivery_id):
+                raise ValueError("routing child conflict: target delivery changed")
+            existing_activation = None
+            if target_task_kind == "triage_issue":
+                existing_activation = conn.execute(
+                    """
+                    SELECT delivery_id FROM events
+                    WHERE canonical_key=?
+                      AND task_kind='triage_issue'
+                      AND state <> 'skipped'
+                      AND delivery_id NOT LIKE 'route:%'
+                    ORDER BY received_at, delivery_id
+                    LIMIT 1
+                    """,
+                    (target_canonical_key,),
+                ).fetchone()
+            synthetic_state = "skipped" if existing_activation is not None else "queued"
+            synthetic_error = (
+                f"activation already owned by delivery {existing_activation['delivery_id']}"
+                if existing_activation is not None
+                else None
+            )
+            conn.execute(
+                """
+                UPDATE routing_children
+                SET target_canonical_key=?, target_delivery_id=?, completed_at=?
+                WHERE source_canonical_key=? AND target_project_id=?
+                """,
+                (target_canonical_key, target_delivery_id, now, source_canonical_key, project_id),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                  instance_id, delivery_id, event_type, canonical_event, task_kind,
+                  repo, repository_id, item_kind, item_number, canonical_key, issue_key,
+                  payload_json, received_at, state, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_instance_id,
+                    target_delivery_id,
+                    target_event_type,
+                    target_canonical_event,
+                    target_task_kind,
+                    target_repo,
+                    project_id,
+                    target_item_kind,
+                    target_item_number,
+                    target_canonical_key,
+                    target_issue_key,
+                    json.dumps(target_payload, separators=(",", ":")),
+                    now,
+                    synthetic_state,
+                    synthetic_error,
+                ),
+            )
+            completed = conn.execute(
+                """
+                SELECT source_canonical_key, target_project_id, mode, idempotency_token,
+                       target_canonical_key, target_delivery_id, created_at, completed_at
+                FROM routing_children
+                WHERE source_canonical_key=? AND target_project_id=?
+                """,
+                (source_canonical_key, project_id),
+            ).fetchone()
+        assert completed is not None
+        return RoutingChildRow(**dict(completed))
 
     def record_routing_decision(
         self,

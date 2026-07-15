@@ -701,13 +701,11 @@ def create_app(
                 return JSONResponse({"delivery": delivery_id, "state": "skipped"}, status_code=202)
 
         db: Database = bag["db"]
-        routed_target_event = db.latest_event_for_issue(event.item.key)
         if (
             event.task_kind == "triage_issue"
+            and event.event != "issue.reopened"
             and db.is_routed_target(event.item.key)
-            and routed_target_event is not None
-            and routed_target_event.delivery_id.startswith("route:")
-            and routed_target_event.state in {"queued", "running"}
+            and db.has_synthetic_routing_event(event.item.key)
         ):
             db.record_event(
                 instance_id=instance_id,

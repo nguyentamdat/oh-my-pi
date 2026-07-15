@@ -33,7 +33,7 @@ def _system_prompt() -> str:
 
 
 class RoutingLLMClassifier:
-    """Classify one allowlisted routing target; invalid output means no route."""
+    """Classify allowlisted routing targets; invalid output means no route."""
 
     def __init__(
         self,
@@ -157,30 +157,44 @@ class RoutingLLMClassifier:
         result = json.loads(content)
         if not isinstance(result, Mapping):
             raise ValueError("routing content must be an object")
-        target_key = result.get("target_key")
-        confidence = result.get("confidence")
-        if target_key is None:
-            return RouteDecision(target=None, confidence=0.0, candidates=())
-        target = next((candidate for candidate in self._policy.targets if candidate.key == target_key), None)
-        if target is None:
-            raise ValueError("routing response selected an unknown target")
-        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
-            raise ValueError("routing response has invalid confidence")
-        raw_evidence = result.get("evidence")
-        evidence = (
-            tuple(item[:200] for item in raw_evidence[:3] if isinstance(item, str) and item.strip())
-            if isinstance(raw_evidence, list)
-            else ()
-        )
-        candidate = RouteCandidate(
-            target=target,
-            score=round(float(confidence) * 100),
-            confidence=float(confidence),
-            paths=(),
-            aliases=(),
-            signals=evidence,
-        )
+        raw_targets = result.get("targets")
+        if not isinstance(raw_targets, list):
+            raise ValueError("routing content must contain a targets list")
         issue_text = f"{title}\n{body}".casefold()
-        grounded = any(item.casefold() in issue_text for item in evidence)
-        selected = target if confidence >= AUTO_ROUTE_CONFIDENCE and grounded else None
-        return RouteDecision(target=selected, confidence=float(confidence), candidates=(candidate,))
+        candidates: list[RouteCandidate] = []
+        seen: set[str] = set()
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, Mapping):
+                raise ValueError("routing target must be an object")
+            target_key = raw_target.get("target_key")
+            confidence = raw_target.get("confidence")
+            target = next((candidate for candidate in self._policy.targets if candidate.key == target_key), None)
+            if target is None or target.key in seen:
+                raise ValueError("routing response selected an unknown or duplicate target")
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+                raise ValueError("routing response has invalid confidence")
+            raw_quotes = raw_target.get("issue_quotes")
+            quotes = (
+                tuple(item.strip()[:200] for item in raw_quotes[:3] if isinstance(item, str) and item.strip())
+                if isinstance(raw_quotes, list)
+                else ()
+            )
+            grounded = any(quote.casefold() in issue_text for quote in quotes)
+            effective_confidence = float(confidence) if grounded else min(float(confidence), 0.6)
+            candidates.append(
+                RouteCandidate(
+                    target=target,
+                    score=round(effective_confidence * 100),
+                    confidence=effective_confidence,
+                    paths=(),
+                    aliases=(),
+                    signals=quotes,
+                )
+            )
+            seen.add(target.key)
+        candidates.sort(key=lambda candidate: (-candidate.confidence, candidate.key))
+        selected = (
+            candidates[0].target if len(candidates) == 1 and candidates[0].confidence >= AUTO_ROUTE_CONFIDENCE else None
+        )
+        confidence = candidates[0].confidence if candidates else 0.0
+        return RouteDecision(target=selected, confidence=confidence, candidates=tuple(candidates))

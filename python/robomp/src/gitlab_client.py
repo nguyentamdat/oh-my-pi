@@ -138,6 +138,52 @@ class GitLabClient:
         data = await self.request("GET", f"{self._project_path(project_id)}/issues/{_iid(iid)}")
         return _issue_from_payload(project_id, data)
 
+    async def create_issue(
+        self,
+        project_id: int,
+        *,
+        title: str,
+        description: str,
+        labels: list[str] | None = None,
+    ) -> GitLabIssueInfo:
+        project_path = self._project_path(project_id)
+        if not isinstance(title, str) or not title:
+            raise ValueError("title must be a non-empty string")
+        if not isinstance(description, str) or not description:
+            raise ValueError("description must be a non-empty string")
+        if labels is not None and (not isinstance(labels, list) or not all(isinstance(label, str) for label in labels)):
+            raise ValueError("labels must be a list of strings")
+        fields: dict[str, Any] = {"title": title, "description": description}
+        if labels is not None:
+            fields["labels"] = ",".join(labels)
+        data = await self.request("POST", f"{project_path}/issues", json=fields)
+        return _issue_from_payload(project_id, data)
+
+    async def find_issue_by_marker(self, project_id: int, marker: str) -> GitLabIssueInfo | None:
+        project_path = self._project_path(project_id)
+        if not isinstance(marker, str) or not marker:
+            raise ValueError("marker must be a non-empty string")
+        matches: list[GitLabIssueInfo] = []
+        page = 1
+        while True:
+            data = await self.request(
+                "GET",
+                f"{project_path}/issues",
+                params={"search": marker, "in": "description", "state": "all", "per_page": 100, "page": page},
+            )
+            if not isinstance(data, list) or not all(isinstance(item, Mapping) for item in data):
+                raise ValueError("GitLab issue marker search response must be a list of objects")
+            matches.extend(
+                _issue_from_payload(project_id, issue)
+                for issue in data
+                if marker in str(issue.get("description") or "")
+            )
+            if len(matches) > 1:
+                raise ValueError("GitLab issue marker search returned multiple exact matches")
+            if len(data) < 100:
+                return matches[0] if matches else None
+            page += 1
+
     async def list_issue_related_merge_requests(
         self,
         project_id: int,

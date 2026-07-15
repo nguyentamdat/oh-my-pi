@@ -231,6 +231,128 @@ def test_routing_intent_survives_pre_completion_crash_and_retry(tmp_path: Path) 
         after_move.close()
 
 
+def test_routing_children_persist_multiple_targets_and_events(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    planned = db.plan_routing_children(source, [(202, "auto_implement"), (303, "auto_move")])
+    first, second = planned
+    assert first.target_canonical_key is None
+    assert second.target_canonical_key is None
+    assert all(len(child.idempotency_token) == 48 for child in planned)
+    assert len({child.idempotency_token for child in planned}) == 2
+    assert db.plan_routing_children(source, [(202, "auto_implement"), (303, "auto_move")]) == planned
+    with pytest.raises(ValueError, match="conflicts"):
+        db.plan_routing_children(source, [(202, "auto_implement")])
+
+    completed = []
+    for project_id, iid, mode in ((202, 19, "auto_implement"), (303, 23, "auto_move")):
+        delivery_id = f"route:child:{project_id}:{iid}"
+        completed.append(
+            db.complete_routing_child_event(
+                source_canonical_key=source,
+                target_project_id=project_id,
+                target_delivery_id=delivery_id,
+                target_event_type="Issue Hook",
+                target_canonical_event="issue.routed",
+                target_task_kind="triage_issue" if mode == "auto_implement" else "routing_complete",
+                target_repo=f"ica/{project_id}",
+                target_item_kind="issue",
+                target_item_number=iid,
+                target_issue_key=canonical_item_key("gitlab-target", str(project_id), "issue", iid),
+                target_payload={"object_kind": "issue"},
+                target_instance_id="gitlab-target",
+            )
+        )
+
+    children = db.list_routing_children(source)
+    assert children == completed
+    assert [child.target_project_id for child in children] == ["202", "303"]
+    assert all(child.completed_at is not None for child in children)
+    assert all(db.is_routed_target(child.target_canonical_key or "") for child in children)
+    assert db.has_synthetic_routing_event(children[0].target_canonical_key or "")
+    assert not db.has_synthetic_routing_event(children[1].target_canonical_key or "")
+    assert {(event.repository_id, event.task_kind, event.state) for event in db.list_events()} == {
+        ("202", "triage_issue", "queued"),
+        ("303", "routing_complete", "queued"),
+    }
+
+
+def test_routing_child_adopts_existing_native_activation(db: Database) -> None:
+    source = canonical_item_key("gitlab-source", "101", "issue", 7)
+    target = canonical_item_key("gitlab-target", "202", "issue", 19)
+    db.plan_routing_children(source, [(202, "auto_implement")])
+    assert db.record_event(
+        instance_id="gitlab-target",
+        delivery_id="native-activation",
+        event_type="Issue Hook",
+        canonical_event="issue.updated",
+        task_kind="triage_issue",
+        repo="ica/202",
+        repository_id="202",
+        item_kind="issue",
+        item_number=19,
+        canonical_key=target,
+        issue_key=target,
+        payload={"object_kind": "issue"},
+    )
+
+    db.complete_routing_child_event(
+        source_canonical_key=source,
+        target_project_id=202,
+        target_delivery_id="route:child:202:19",
+        target_event_type="RoboOMP Route",
+        target_canonical_event="issue.routed",
+        target_task_kind="triage_issue",
+        target_repo="ica/202",
+        target_item_kind="issue",
+        target_item_number=19,
+        target_issue_key=target,
+        target_payload={"object_kind": "issue"},
+        target_instance_id="gitlab-target",
+    )
+
+    native = db.get_event("native-activation", instance_id="gitlab-target")
+    synthetic = db.get_event("route:child:202:19", instance_id="gitlab-target")
+    assert native is not None and native.state == "queued"
+    assert synthetic is not None and synthetic.state == "skipped"
+    assert synthetic.last_error == "activation already owned by delivery native-activation"
+
+
+def test_routing_child_migration_marks_legacy_plan_for_manual_reconciliation(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy-routing-child.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE routing_children (
+          source_canonical_key TEXT NOT NULL,
+          target_project_id TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          target_canonical_key TEXT,
+          target_delivery_id TEXT,
+          created_at TEXT NOT NULL,
+          completed_at TEXT,
+          PRIMARY KEY (source_canonical_key, target_project_id)
+        );
+        INSERT INTO routing_children (
+          source_canonical_key, target_project_id, mode, created_at
+        ) VALUES (
+          'gitlab-source:101:issue:7', '202', 'auto_implement', '2026-07-15T00:00:00Z'
+        );
+        """
+    )
+    conn.close()
+
+    database = Database(path)
+    try:
+        children = database.list_routing_children("gitlab-source:101:issue:7")
+    finally:
+        database.close()
+
+    assert len(children) == 1
+    assert children[0].idempotency_token == "legacy:gitlab-source:101:issue:7:202"
+
+
 def test_routing_decisions_retain_recommendation_and_later_explicit_route(db: Database) -> None:
     source = canonical_item_key("gitlab-source", "101", "issue", 7)
     candidates = [

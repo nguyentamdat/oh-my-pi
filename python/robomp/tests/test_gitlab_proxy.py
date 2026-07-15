@@ -769,3 +769,113 @@ async def test_bad_hmac_header_is_not_accepted_by_gitlab_route(tmp_path: Path) -
             headers={HEADER_TIMESTAMP: str(int(time.time())), HEADER_SIGNATURE: "0" * 64},
         )
     assert response.status_code == 401
+
+
+async def test_child_issue_create_and_marker_lookup_use_exact_project_token(tmp_path: Path) -> None:
+    source_project_id = _PROJECT_ID
+    target_project_id = 357
+    source_token = "glpat-source-token"
+    target_token = "glpat-target-token"
+    marker = "<!-- robomp:child-retry -->"
+    seen: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.headers["PRIVATE-TOKEN"], body))
+        if request.method == "POST":
+            assert request.url.path == f"/api/v4/projects/{target_project_id}/issues"
+            assert body == {
+                "title": "Child issue",
+                "description": f"Retry-safe child\n{marker}",
+                "labels": "bot,child",
+            }
+            return httpx.Response(
+                201,
+                json={
+                    "iid": 9,
+                    "title": body["title"],
+                    "description": body["description"],
+                    "state": "opened",
+                    "author": {"username": "robomp"},
+                    "labels": ["bot", "child"],
+                    "web_url": f"{_BASE_URL}/group/widget/-/issues/9",
+                },
+            )
+        assert request.method == "GET"
+        assert request.url.path == f"/api/v4/projects/{source_project_id}/issues"
+        assert dict(request.url.params) == {
+            "search": marker,
+            "in": "description",
+            "state": "all",
+            "per_page": "100",
+            "page": "1",
+        }
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "iid": 10,
+                    "title": "Recovered child",
+                    "description": f"Retry-safe child\n{marker}",
+                    "state": "opened",
+                    "author": {"username": "robomp"},
+                    "labels": ["bot"],
+                    "web_url": f"{_BASE_URL}/group/widget/-/issues/10",
+                }
+            ],
+        )
+
+    app = _mapped_app(
+        tmp_path,
+        handler,
+        project_ids=frozenset({source_project_id, target_project_id}),
+        project_tokens={source_project_id: source_token, target_project_id: target_token},
+        routing_token="glpat-routing-token",
+    )
+    proxy = GitLabProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+
+    created = await proxy.create_issue(
+        target_project_id,
+        title="Child issue",
+        description=f"Retry-safe child\n{marker}",
+        labels=["bot", "child"],
+    )
+    found = await proxy.find_issue_by_marker(source_project_id, marker)
+
+    assert created.project_id == target_project_id
+    assert found is not None
+    assert found.project_id == source_project_id
+    assert seen == [
+        (
+            "POST",
+            target_token,
+            {"title": "Child issue", "description": f"Retry-safe child\n{marker}", "labels": "bot,child"},
+        ),
+        ("GET", source_token, None),
+    ]
+
+
+async def test_child_issue_proxy_routes_reject_unknown_project(tmp_path: Path) -> None:
+    app = _app(tmp_path, lambda request: pytest.fail(f"unexpected upstream request: {request.url}"))
+    project_id = _PROJECT_ID + 1
+    create_path = f"/gl/v1/projects/{project_id}/issues"
+    create_body = json.dumps({"title": "Child", "description": "Details"}).encode()
+    find_path = f"/gl/v1/projects/{project_id}/issues/find_by_marker?marker=retry"
+
+    async with await _client(app) as client:
+        create = await client.post(
+            create_path,
+            content=create_body,
+            headers={**_headers("POST", create_path, create_body), "Content-Type": "application/json"},
+        )
+        found = await client.get(
+            find_path,
+            headers=_headers("GET", find_path),
+        )
+
+    assert create.status_code == 403
+    assert found.status_code == 403

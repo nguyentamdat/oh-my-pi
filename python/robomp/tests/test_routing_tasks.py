@@ -31,6 +31,13 @@ class FakeGitLab:
             web_url="https://gitlab.example/ica/protocol/-/issues/11",
             id=110,
         )
+        self.projects = {
+            332: ("ica/client", "dev"),
+            356: ("ica/server", "qc"),
+            357: ("ica/protocol", "master"),
+        }
+        self.children: dict[int, list[GitLabIssueInfo]] = {}
+        self.fail_create_project_id: int | None = None
         self.resolve_result: GitLabIssueInfo | None = None
         self.moves: list[tuple[int, int, int]] = []
         self.added_labels: list[tuple[int, int, tuple[str, ...]]] = []
@@ -40,16 +47,22 @@ class FakeGitLab:
 
     async def get_issue(self, project_id: int, iid: int) -> GitLabIssueInfo:
         self.get_issue_calls += 1
-        return self.source
+        if project_id == self.source.project_id and iid == self.source.iid:
+            return self.source
+        for issue in self.children.get(project_id, []):
+            if issue.iid == iid:
+                return issue
+        return self.moved
 
     async def get_project(self, project_id: int) -> GitLabProjectInfo:
+        path, branch = self.projects[project_id]
         return GitLabProjectInfo(
             id=project_id,
-            path_with_namespace="ica/protocol",
-            default_branch="master",
-            http_url_to_repo="https://gitlab.example/ica/protocol.git",
+            path_with_namespace=path,
+            default_branch=branch,
+            http_url_to_repo=f"https://gitlab.example/{path}.git",
             visibility="private",
-            web_url="https://gitlab.example/ica/protocol",
+            web_url=f"https://gitlab.example/{path}",
         )
 
     async def resolve_moved_issue(
@@ -62,7 +75,46 @@ class FakeGitLab:
 
     async def move_issue(self, source_project_id: int, iid: int, target_project_id: int) -> GitLabIssueInfo:
         self.moves.append((source_project_id, iid, target_project_id))
-        return self.moved
+        path, _ = self.projects[target_project_id]
+        return replace(
+            self.source,
+            project_id=target_project_id,
+            iid=11,
+            web_url=f"https://gitlab.example/{path}/-/issues/11",
+            id=110,
+        )
+
+    async def create_issue(
+        self,
+        project_id: int,
+        *,
+        title: str,
+        description: str,
+        labels: list[str] | None = None,
+    ) -> GitLabIssueInfo:
+        if self.fail_create_project_id == project_id:
+            raise RuntimeError("injected create failure")
+        path, _ = self.projects[project_id]
+        iid = len(self.children.get(project_id, [])) + 20
+        issue = GitLabIssueInfo(
+            project_id=project_id,
+            iid=iid,
+            title=title,
+            description=description,
+            state="opened",
+            author="robomp",
+            labels=tuple(labels or ()),
+            web_url=f"https://gitlab.example/{path}/-/issues/{iid}",
+            id=project_id * 1000 + iid,
+        )
+        self.children.setdefault(project_id, []).append(issue)
+        return issue
+
+    async def find_issue_by_marker(self, project_id: int, marker: str) -> GitLabIssueInfo | None:
+        return next(
+            (issue for issue in self.children.get(project_id, []) if marker in issue.description),
+            None,
+        )
 
     async def add_issue_labels(self, project_id: int, iid: int, labels: list[str]) -> GitLabIssueInfo:
         self.added_labels.append((project_id, iid, tuple(labels)))
@@ -112,6 +164,34 @@ def _policy(mode: str) -> RoutingPolicy:
                     "aliases": ["protocol", "packet"],
                     "signals": ["protobuf", "response field"],
                 }
+            ],
+        }
+    )
+
+
+def _multi_policy() -> RoutingPolicy:
+    return RoutingPolicy.from_json(
+        {
+            "intake_project_id": 2080,
+            "targets": [
+                {
+                    "key": "client",
+                    "project_id": 332,
+                    "mode": "recommend",
+                    "default_branch": "dev",
+                    "paths": ["client"],
+                    "aliases": ["client", "ui"],
+                    "signals": ["inventory", "skin"],
+                },
+                {
+                    "key": "server",
+                    "project_id": 356,
+                    "mode": "auto_implement",
+                    "default_branch": "qc",
+                    "paths": ["server"],
+                    "aliases": ["server", "backend"],
+                    "signals": ["api", "command"],
+                },
             ],
         }
     )
@@ -288,7 +368,7 @@ async def test_explicit_route_override_skips_llm_classifier(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_deterministic_target_match_skips_llm_classifier(tmp_path) -> None:
+async def test_deterministic_target_survives_empty_llm_result(tmp_path) -> None:
     db = Database(tmp_path / "routing.sqlite")
     gitlab = FakeGitLab()
     gitlab.source = replace(
@@ -307,4 +387,165 @@ async def test_deterministic_target_match_skips_llm_classifier(tmp_path) -> None
     )
 
     assert result.action is RouteAction.MOVED
+    assert classifier.calls == [("Protocol packet protobuf response field", "", ())]
+
+
+def _candidate(policy: RoutingPolicy, key: str, confidence: float) -> RouteCandidate:
+    target = next(target for target in policy.targets if target.key == key)
+    return RouteCandidate(
+        target=target,
+        score=round(confidence * 100),
+        confidence=confidence,
+        paths=(),
+        aliases=(),
+        signals=("classifier",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_strong_deterministic_and_weak_contextual_target_routes_only_primary(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(
+        gitlab.source,
+        title="Server backend API command fails",
+        description="The backend command returns an error",
+    )
+    policy = _multi_policy()
+    client = _candidate(policy, "client", 0.6)
+    classifier = FakeClassifier(RouteDecision(target=None, confidence=0.6, candidates=(client,)))
+
+    result = await route_issue(
+        event=_event(),
+        policy=policy,
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.IMPLEMENTATION_QUEUED
+    assert gitlab.moves == [(2080, 7, 356)]
+    assert gitlab.children == {}
+
+
+@pytest.mark.asyncio
+async def test_multi_project_classification_creates_child_for_every_strong_target(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(gitlab.source, title="Inventory API and UI are inconsistent", description="")
+    policy = _multi_policy()
+    client = _candidate(policy, "client", 0.95)
+    server = _candidate(policy, "server", 0.93)
+    classifier = FakeClassifier(
+        RouteDecision(target=None, confidence=0.95, candidates=(client, server), explicit=False)
+    )
+
+    result = await route_issue(
+        event=_event(),
+        policy=policy,
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.CHILDREN_QUEUED
+    assert set(gitlab.children) == {332, 356}
+    assert gitlab.children[332][0].labels == ("routed",)
+    assert gitlab.children[356][0].labels == ("routed",)
+    client_description = gitlab.children[332][0].description
+    assert client_description.startswith(f"Routed from {gitlab.source.web_url}\n\n")
+    assert "\n\n<!-- roboomp-child:" in client_description
+    assert "\\n" not in client_description
+    assert _event().item.key not in client_description
+    children = db.list_routing_children(_event().item.key)
+    assert [child.target_project_id for child in children] == ["332", "356"]
+    client_event = db.get_event("route:delivery-1:332:20", instance_id="gitlab-zingplay")
+    server_event = db.get_event("route:delivery-1:356:20", instance_id="gitlab-zingplay")
+    assert client_event is not None and client_event.task_kind == "routing_complete"
+    assert server_event is not None and server_event.task_kind == "triage_issue"
+    server_payload = ForgeEvent.from_dict(server_event.payload)
+    assert "roboomp" in server_payload.labels
+    assert "ica/client#20" in gitlab.notes[-1][2]
+    assert "ica/server#20" in gitlab.notes[-1][2]
+
+
+@pytest.mark.asyncio
+async def test_multi_project_retry_reuses_created_child_and_finishes_plan(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(gitlab.source, title="Inventory API and UI are inconsistent", description="")
+    policy = _multi_policy()
+    client = _candidate(policy, "client", 0.95)
+    server = _candidate(policy, "server", 0.95)
+    classifier = FakeClassifier(
+        RouteDecision(target=None, confidence=0.95, candidates=(client, server), explicit=False)
+    )
+    gitlab.fail_create_project_id = 356
+
+    with pytest.raises(RuntimeError, match="injected create failure"):
+        await route_issue(
+            event=_event(),
+            policy=policy,
+            db=db,
+            gitlab=gitlab,
+            classifier=classifier,  # type: ignore[arg-type]
+        )
+
+    planned = db.list_routing_children(_event().item.key)
+    assert [child.target_project_id for child in planned] == ["332", "356"]
+    assert len(gitlab.children[332]) == 1
+    gitlab.fail_create_project_id = None
+    gitlab.projects[332] = ("ica/client", "changed-after-child")
+
+    result = await route_issue(
+        event=_event("delivery-2"),
+        policy=policy,
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.CHILDREN_QUEUED
+    assert len(gitlab.children[332]) == 1
+    assert len(gitlab.children[356]) == 1
+    assert all(child.completed_at is not None for child in db.list_routing_children(_event().item.key))
+    assert db.get_event("route:delivery-2:332:20", instance_id="gitlab-zingplay") is None
+    recovered_event = db.get_event("route:delivery-2:356:20", instance_id="gitlab-zingplay")
+    assert recovered_event is not None and recovered_event.task_kind == "triage_issue"
+    repeated = await route_issue(
+        event=_event("delivery-3"),
+        policy=policy,
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+    assert repeated.action is RouteAction.CHILDREN_QUEUED
+    child_notes = [body for _, _, body in gitlab.notes if "created linked child issues" in body]
+    assert len(child_notes) == 1
+    assert child_notes[0].index("ica/client#20") < child_notes[0].index("ica/server#20")
+    assert len(classifier.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_multiple_explicit_route_labels_fan_out_without_classifier(tmp_path) -> None:
+    db = Database(tmp_path / "routing.sqlite")
+    gitlab = FakeGitLab()
+    gitlab.source = replace(
+        gitlab.source,
+        title="Cross-project change",
+        description="",
+        labels=("route::client", "route::server"),
+    )
+    classifier = FakeClassifier(RouteDecision(target=None, confidence=0.0, candidates=()))
+
+    result = await route_issue(
+        event=_event(),
+        policy=_multi_policy(),
+        db=db,
+        gitlab=gitlab,
+        classifier=classifier,  # type: ignore[arg-type]
+    )
+
+    assert result.action is RouteAction.CHILDREN_QUEUED
+    assert set(gitlab.children) == {332, 356}
     assert classifier.calls == []

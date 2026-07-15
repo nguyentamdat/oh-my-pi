@@ -155,6 +155,43 @@ class GitLabProxyClient:
         iid = _iid(iid)
         return _issue_from(await self._request("GET", f"/gl/v1/projects/{project_id}/issues/{iid}"))
 
+    async def create_issue(
+        self,
+        project_id: int,
+        *,
+        title: str,
+        description: str,
+        labels: list[str] | None = None,
+    ) -> GitLabIssueInfo:
+        project_id = _project_id(project_id)
+        if not isinstance(title, str) or not title:
+            raise ValueError("title must be a non-empty string")
+        if not isinstance(description, str) or not description:
+            raise ValueError("description must be a non-empty string")
+        if labels is not None and (not isinstance(labels, list) or not all(isinstance(label, str) for label in labels)):
+            raise ValueError("labels must be a list of strings")
+        fields: dict[str, Any] = {"title": title, "description": description}
+        if labels is not None:
+            fields["labels"] = labels
+        return _issue_from(
+            await self._request(
+                "POST",
+                f"/gl/v1/projects/{project_id}/issues",
+                json_body=fields,
+            )
+        )
+
+    async def find_issue_by_marker(self, project_id: int, marker: str) -> GitLabIssueInfo | None:
+        project_id = _project_id(project_id)
+        if not isinstance(marker, str) or not marker:
+            raise ValueError("marker must be a non-empty string")
+        data = await self._request(
+            "GET",
+            f"/gl/v1/projects/{project_id}/issues/find_by_marker",
+            params={"marker": marker},
+        )
+        return None if data is None else _issue_from(data)
+
     async def list_issue_related_merge_requests(
         self,
         project_id: int,

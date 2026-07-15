@@ -50,6 +50,7 @@ from robomp.github_client import GitHubClient, GitHubError
 from robomp.gitlab_client import (
     GitLabClient,
     GitLabError,
+    GitLabIssueInfo,
     GitLabMergeRequestInfo,
     GitLabProjectInfo,
     GitLabUserInfo,
@@ -1006,6 +1007,45 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         payload = _serialize(project)
         payload["http_url_to_repo"] = trusted_clone
         return JSONResponse(payload)
+
+    @app.post("/gl/v1/projects/{project_id}/issues")
+    async def create_gitlab_issue(request: Request, project_id: int) -> JSONResponse:
+        data = await _json_body(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        title = _require_str(data.get("title"), "title")
+        description = _require_str(data.get("description"), "description")
+        labels = _optional_str_list(data.get("labels"), "labels")
+
+        gitlab = _gitlab_project_client(request, project_id)
+        try:
+            issue: GitLabIssueInfo = await gitlab.create_issue(
+                project_id,
+                title=title,
+                description=description,
+                labels=labels,
+            )
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, settings=settings)
+        return JSONResponse(_serialize(issue))
+
+    @app.get("/gl/v1/projects/{project_id}/issues/find_by_marker")
+    async def find_gitlab_issue_by_marker(
+        request: Request,
+        project_id: int,
+        marker: str | None = None,
+    ) -> Response:
+        await _authenticate(request)
+        project_id = _require_gitlab_project_id(settings, project_id)
+        marker = _require_str(marker, "marker")
+
+        gitlab = _gitlab_project_client(request, project_id)
+        try:
+            issue = await gitlab.find_issue_by_marker(project_id, marker)
+        except GitLabError as exc:
+            return _gitlab_error_response(exc, settings=settings)
+        if issue is None:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return JSONResponse(_serialize(issue))
 
     @app.get("/gl/v1/projects/{project_id}/issues/{iid}")
     async def get_gitlab_issue(request: Request, project_id: int, iid: int) -> JSONResponse:

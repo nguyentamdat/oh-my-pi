@@ -20,6 +20,17 @@ class GitLabBackend(Protocol):
 
     async def get_issue(self, project_id: int, iid: int) -> GitLabIssueInfo: ...
 
+    async def create_issue(
+        self,
+        project_id: int,
+        *,
+        title: str,
+        description: str,
+        labels: list[str] | None = None,
+    ) -> GitLabIssueInfo: ...
+
+    async def find_issue_by_marker(self, project_id: int, marker: str) -> GitLabIssueInfo | None: ...
+
     async def list_issue_related_merge_requests(
         self,
         project_id: int,

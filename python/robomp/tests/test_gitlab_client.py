@@ -375,3 +375,113 @@ async def test_list_issue_closed_by_merge_requests_fetches_all_pages() -> None:
 
     assert [merge_request.iid for merge_request in merge_requests] == list(range(1, 103))
     assert requested_pages == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_create_issue_posts_project_scoped_shape_with_optional_labels() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues"
+        assert json.loads(request.content) == {
+            "title": "Child issue",
+            "description": "Created by retry-safe workflow",
+            "labels": "bot,child",
+        }
+        return httpx.Response(
+            201,
+            json={
+                **_issue(77, ["bot", "child"]),
+                "title": "Child issue",
+                "description": "Created by retry-safe workflow",
+            },
+        )
+
+    issue = await _client(handler).create_issue(
+        PROJECT_ID,
+        title="Child issue",
+        description="Created by retry-safe workflow",
+        labels=["bot", "child"],
+    )
+
+    assert issue.project_id == PROJECT_ID
+    assert issue.iid == 77
+    assert issue.labels == ("bot", "child")
+
+
+@pytest.mark.asyncio
+async def test_find_issue_by_marker_returns_one_exact_description_match_or_none() -> None:
+    marker = "<!-- robomp:retry-123 -->"
+    responses = [
+        [
+            {**_issue(71), "description": f"Child details\n{marker}\n"},
+            {**_issue(72), "description": "unrelated issue"},
+        ],
+        [{**_issue(73), "description": "unrelated issue"}],
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == f"/api/v4/projects/{PROJECT_ID}/issues"
+        assert dict(request.url.params) == {
+            "search": marker,
+            "in": "description",
+            "state": "all",
+            "per_page": "100",
+            "page": "1",
+        }
+        return httpx.Response(200, json=responses.pop(0))
+
+    client = _client(handler)
+
+    match = await client.find_issue_by_marker(PROJECT_ID, marker)
+    absent = await client.find_issue_by_marker(PROJECT_ID, marker)
+
+    assert match is not None
+    assert match.iid == 71
+    assert absent is None
+
+
+@pytest.mark.asyncio
+async def test_find_issue_by_marker_searches_every_page() -> None:
+    marker = "<!-- robomp:retry-page-two -->"
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        if page == 1:
+            return httpx.Response(200, json=[_issue(iid) for iid in range(1, 101)])
+        return httpx.Response(200, json=[{**_issue(101), "description": f"Child\n{marker}"}])
+
+    match = await _client(handler).find_issue_by_marker(PROJECT_ID, marker)
+
+    assert match is not None
+    assert match.iid == 101
+    assert pages == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_find_issue_by_marker_rejects_duplicate_exact_description_matches() -> None:
+    marker = "<!-- robomp:retry-duplicate -->"
+    client = _client(
+        lambda _: httpx.Response(
+            200,
+            json=[
+                {**_issue(71), "description": f"One\n{marker}"},
+                {**_issue(72), "description": f"Two\n{marker}"},
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="multiple exact matches"):
+        await client.find_issue_by_marker(PROJECT_ID, marker)
+
+
+@pytest.mark.asyncio
+async def test_create_and_find_issue_reject_projects_outside_allowlist() -> None:
+    client = _client(lambda request: pytest.fail(f"unexpected request: {request.url}"))
+
+    with pytest.raises(ValueError, match="allowlist"):
+        await client.create_issue(PROJECT_ID + 1, title="Child", description="Details")
+    with pytest.raises(ValueError, match="allowlist"):
+        await client.find_issue_by_marker(PROJECT_ID + 1, "<!-- marker -->")
