@@ -300,6 +300,16 @@ def test_model_pool_single(env: dict[str, str]) -> None:
     assert cfg.pick_model() == cfg.model
 
 
+def test_model_default_uses_gpt_5_6_sol(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+) -> None:
+    monkeypatch.delenv("ROBOMP_MODEL")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.model == "openai-codex/gpt-5.6-sol"
+
+
 def test_model_pool_csv_parses(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
     monkeypatch.setenv(
         "ROBOMP_MODEL",

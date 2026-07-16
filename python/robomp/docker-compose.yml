@@ -73,7 +73,7 @@ services:
       ROBOMP_VOUCH_REVIEW_LABELER: ${ROBOMP_VOUCH_REVIEW_LABELER:-github-actions[bot]}
 
       # --- model selection ---
-      ROBOMP_MODEL: ${ROBOMP_MODEL:-anthropic/claude-sonnet-4-6}
+      ROBOMP_MODEL: ${ROBOMP_MODEL:-openai-codex/gpt-5.6-sol}
       ROBOMP_PROVIDER: ${ROBOMP_PROVIDER:-}
       ROBOMP_THINKING: ${ROBOMP_THINKING:-high}
 
