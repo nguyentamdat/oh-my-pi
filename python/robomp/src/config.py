@@ -161,6 +161,8 @@ class Settings(BaseSettings):
 
     # Dev-only replay header value; if empty, /replay is disabled
     replay_token: SecretStr | None = Field(None, alias="ROBOMP_REPLAY_TOKEN")
+    # Optional reverse-proxy prefix for the embedded dashboard.
+    dashboard_base_path: str = Field("", alias="ROBOMP_DASHBOARD_BASE_PATH")
 
     # Per-submitter rate limiting. `window_seconds` defines the rolling window;
     # `default` is the per-window cap for unknown/first-time submitters;
@@ -250,6 +252,16 @@ class Settings(BaseSettings):
         cleaned = value.strip().removeprefix("@").lower()
         if cleaned.endswith("[bot]"):
             cleaned = cleaned[:-5]
+        return cleaned
+
+    @field_validator("dashboard_base_path", mode="after")
+    @classmethod
+    def _normalize_dashboard_base_path(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return ""
+        if not cleaned.startswith("/") or "//" in cleaned or "?" in cleaned or "#" in cleaned:
+            raise ValueError("ROBOMP_DASHBOARD_BASE_PATH must be a simple absolute path")
         return cleaned
 
     @field_validator("replay_token", mode="before")

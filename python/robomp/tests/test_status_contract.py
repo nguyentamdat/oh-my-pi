@@ -20,7 +20,7 @@ from robomp.server import create_app
 
 # Runtime/timestamp fields vary every run; normalize them so the live payload
 # can be compared against (or regenerated into) a byte-stable committed fixture.
-_VOLATILE_TS_KEYS = {"received_at", "started_at", "last_tool_ts", "updated_at"}
+_VOLATILE_TS_KEYS = {"received_at", "started_at", "finished_at", "last_tool_ts", "updated_at", "created_at"}
 _FIXED_TS = "2024-01-01T00:00:00+00:00"
 _UPDATE_ENV = "ROBOMP_UPDATE_STATUS_CONTRACT"
 
@@ -41,7 +41,14 @@ def _normalize_for_fixture(value: Any) -> Any:
     return value
 
 
-def test_status_contract(settings: Settings) -> None:
+def test_status_contract(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROBOMP_GITLAB_BASE_URL", "https://dashboard:secret@gitlab.zingplay.com")
+    monkeypatch.setenv("ROBOMP_GITLAB_WEBHOOK_SECRET", "test-gitlab-webhook-secret")
+    monkeypatch.setenv("ROBOMP_GITLAB_PROJECT_IDS", "2080,332,356")
+    monkeypatch.setenv("ROBOMP_GITLAB_BOT_LOGIN", "robomp-gitlab-bot")
+    reset_settings_cache()
+    settings = Settings()  # type: ignore[call-arg]
+    settings.ensure_paths()
     app = create_app(settings)
     with TestClient(app) as client:
         # Seed AFTER startup:
@@ -163,6 +170,51 @@ def test_status_contract(settings: Settings) -> None:
             number=6,
         )
 
+        # 8. A multi-project GitLab fan-out from triage #7. One child is
+        # planned only; the other has its queued synthetic event.
+        source = "gitlab-zingplay:2080:issue:7"
+        db.record_event(
+            instance_id="gitlab-zingplay",
+            delivery_id="source-triage-7",
+            event_type="Issue Hook",
+            repo="ica/triage",
+            repository_id="2080",
+            item_kind="issue",
+            item_number=7,
+            canonical_key=source,
+            issue_key=source,
+            state="done",
+            payload={"object_kind": "issue"},
+        )
+        db.record_routing_decision(
+            instance_id="gitlab-zingplay",
+            delivery_id="source-triage-7",
+            source_canonical_key=source,
+            ranked_candidates=[
+                {"project_id": 332, "key": "client"},
+                {"project_id": 356, "key": "server"},
+            ],
+            selected_target_key=None,
+            selected_project_id=None,
+            explicit=False,
+            action="children_queued",
+            mode="none",
+        )
+        db.plan_routing_children(source, [(332, "recommend"), (356, "auto_implement")])
+        db.complete_routing_child_event(
+            source_canonical_key=source,
+            target_project_id=356,
+            target_delivery_id="route:356:19",
+            target_event_type="RoboOMP Route",
+            target_repo="ica/server",
+            target_issue_key="gitlab-zingplay:356:issue:19",
+            target_payload={"object_kind": "issue"},
+            target_item_kind="issue",
+            target_item_number=19,
+            target_task_kind="triage_issue",
+            target_instance_id="gitlab-zingplay",
+        )
+
         resp = client.get("/api/status")
         assert resp.status_code == 200
         data = resp.json()
@@ -176,6 +228,7 @@ def test_status_contract(settings: Settings) -> None:
             "inflight",
             "issues",
             "recent_events",
+            "routing_flows",
         }
         assert set(data.keys()) == expected_keys
 

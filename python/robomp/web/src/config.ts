@@ -6,33 +6,41 @@
 export interface AppConfig {
   replayEnabled: boolean;
   replayToken: string;
+  basePath: string;
 }
 
 function readConfig(): AppConfig {
   const node = document.getElementById("robomp-config");
   const text = node?.textContent?.trim();
   if (!text || text === "__ROBOMP_CONFIG__") {
-    return { replayEnabled: false, replayToken: "" };
+    return { replayEnabled: false, replayToken: "", basePath: "" };
   }
   try {
     const parsed: unknown = JSON.parse(text);
     if (parsed === null || typeof parsed !== "object") {
-      return { replayEnabled: false, replayToken: "" };
+      return { replayEnabled: false, replayToken: "", basePath: "" };
     }
     const record = parsed as Record<string, unknown>;
     return {
       replayEnabled: Boolean(record.replayEnabled),
-      replayToken: typeof record.replayToken === "string" ? record.replayToken : "",
+      replayToken:
+        typeof record.replayToken === "string" ? record.replayToken : "",
+      basePath: typeof record.basePath === "string" ? record.basePath : "",
     };
   } catch {
-    return { replayEnabled: false, replayToken: "" };
+    return { replayEnabled: false, replayToken: "", basePath: "" };
   }
 }
 
 export const CONFIG: AppConfig = readConfig();
 
-export const AUTH_HEADERS: Readonly<Record<string, string>> = CONFIG.replayEnabled
-  ? Object.freeze({ "X-Robomp-Replay-Token": CONFIG.replayToken })
-  : Object.freeze({});
+export const AUTH_HEADERS: Readonly<Record<string, string>> =
+  CONFIG.replayEnabled
+    ? Object.freeze({ "X-Robomp-Replay-Token": CONFIG.replayToken })
+    : Object.freeze({});
 
 export const POLL_INTERVAL_MS = 3000;
+
+export function apiPath(path: string): string {
+  return `${CONFIG.basePath}${path}`;
+}

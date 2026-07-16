@@ -11,16 +11,16 @@
   },
   "inflight": [],
   "event_counts": {
-    "queued": 1,
+    "queued": 2,
     "running": 1,
-    "done": 2,
+    "done": 3,
     "failed": 3,
     "skipped": 0
   },
   "issue_event_counts": {
-    "queued": 1,
+    "queued": 2,
     "running": 1,
-    "done": 2,
+    "done": 3,
     "failed": 1,
     "skipped": 0
   },
@@ -143,6 +143,28 @@
   ],
   "recent_events": [
     {
+      "delivery_id": "route:356:19",
+      "event_type": "RoboOMP Route",
+      "repo": "ica/server",
+      "issue_key": "gitlab-zingplay:356:issue:19",
+      "state": "queued",
+      "attempts": 0,
+      "received_at": "2024-01-01T00:00:00+00:00",
+      "last_error": null,
+      "issue_state": null
+    },
+    {
+      "delivery_id": "source-triage-7",
+      "event_type": "Issue Hook",
+      "repo": "ica/triage",
+      "issue_key": "gitlab-zingplay:2080:issue:7",
+      "state": "done",
+      "attempts": 0,
+      "received_at": "2024-01-01T00:00:00+00:00",
+      "last_error": null,
+      "issue_state": null
+    },
+    {
       "delivery_id": "queued-x",
       "event_type": "issues",
       "repo": "octo/widget",
@@ -218,6 +240,51 @@
       "received_at": "2024-01-01T00:00:00+00:00",
       "last_error": null,
       "issue_state": "reproducing"
+    }
+  ],
+  "routing_flows": [
+    {
+      "source_key": "gitlab-zingplay:2080:issue:7",
+      "source_repo": "ica/triage",
+      "source_number": 7,
+      "source_url": "https://gitlab.zingplay.com/ica/triage/-/issues/7",
+      "action": "children_queued",
+      "explicit": false,
+      "created_at": "2024-01-01T00:00:00+00:00",
+      "targets": [
+        {
+          "key": "client",
+          "project_id": "332",
+          "mode": "recommend",
+          "canonical_key": null,
+          "repo": null,
+          "number": null,
+          "url": null,
+          "delivery_id": null,
+          "task_kind": null,
+          "state": "planned",
+          "attempts": 0,
+          "last_error": null,
+          "started_at": null,
+          "finished_at": null
+        },
+        {
+          "key": "server",
+          "project_id": "356",
+          "mode": "auto_implement",
+          "canonical_key": "gitlab-zingplay:356:issue:19",
+          "repo": "ica/server",
+          "number": 19,
+          "url": "https://gitlab.zingplay.com/ica/server/-/issues/19",
+          "delivery_id": "route:356:19",
+          "task_kind": "triage_issue",
+          "state": "queued",
+          "attempts": 0,
+          "last_error": null,
+          "started_at": null,
+          "finished_at": null
+        }
+      ]
     }
   ]
 }

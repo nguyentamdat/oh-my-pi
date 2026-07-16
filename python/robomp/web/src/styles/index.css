@@ -247,6 +247,10 @@ a:hover {
   background: color-mix(in oklch, var(--color-info) 18%, transparent);
   color: var(--color-info);
 }
+.pill.planned {
+  color: var(--color-ink-200);
+  box-shadow: inset 0 0 0 1px var(--color-ink-500);
+}
 .pill.running {
   background: color-mix(in oklch, var(--color-warn) 18%, transparent);
   color: var(--color-warn);
@@ -1101,6 +1105,195 @@ code,
   font-size: 11.5px;
   color: var(--color-ink-400);
   margin: 0;
+}
+
+/* Routing flows — one flat source group with compact child rows. */
+.rmp-routing {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.rmp-routing-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.rmp-route {
+  overflow: hidden;
+  border: 1px solid var(--color-stroke);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-1);
+}
+.rmp-route-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px 16px;
+  padding: 13px 16px;
+}
+.rmp-route-source {
+  min-width: 0;
+  grid-row: 1 / span 2;
+}
+.rmp-route-kicker {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-ink-400);
+}
+.rmp-route-source h3,
+.rmp-pipeline-head-label {
+  margin: 0;
+}
+.rmp-route-source h3 {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.rmp-route-link {
+  color: var(--color-accent-2);
+  text-decoration: none;
+}
+.rmp-route-link:hover {
+  text-decoration: underline;
+}
+.rmp-route-link:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+.rmp-route-badges {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.rmp-route-explicit {
+  color: var(--color-accent-2);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in oklch, var(--color-accent-2) 55%, transparent);
+}
+.rmp-route-automatic {
+  color: var(--color-ink-300);
+}
+.rmp-route-created {
+  font-size: 10.5px;
+  text-align: right;
+  color: var(--color-ink-400);
+}
+.rmp-route-targets {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--color-stroke);
+}
+.rmp-route-target {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) auto minmax(240px, 1.4fr);
+  align-items: center;
+  gap: 6px 16px;
+  padding: 11px 16px;
+}
+.rmp-route-target + .rmp-route-target {
+  border-top: 1px solid var(--color-stroke-soft);
+}
+.rmp-route-target[data-state="running"] {
+  background: color-mix(in oklch, var(--color-warn) 6%, var(--color-surface-1));
+}
+.rmp-route-target[data-state="failed"] {
+  background: color-mix(in oklch, var(--color-err) 7%, var(--color-surface-1));
+}
+.rmp-route-target-main,
+.rmp-route-target-meta {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.rmp-route-target-main {
+  gap: 2px 8px;
+}
+.rmp-route-target-key {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-100);
+}
+.rmp-route-project {
+  font-size: 10.5px;
+  color: var(--color-ink-400);
+}
+.rmp-route-target-main .rmp-route-link {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rmp-route-state {
+  justify-self: start;
+}
+.rmp-route-target-meta {
+  gap: 3px 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--color-ink-300);
+}
+.rmp-route-target-meta > :not(:first-child)::before {
+  content: "·";
+  margin: 0 7px;
+  color: var(--color-ink-500);
+}
+.rmp-route-error {
+  grid-column: 1 / -1;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklch, var(--color-err) 10%, transparent);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  color: var(--color-err);
+}
+.rmp-route-error strong {
+  margin-right: 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 640px) {
+  .rmp-route-head {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rmp-route-source {
+    grid-row: auto;
+  }
+  .rmp-route-badges {
+    justify-content: flex-start;
+  }
+  .rmp-route-created {
+    text-align: left;
+  }
+  .rmp-route-target {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 7px 10px;
+  }
+  .rmp-route-target-main {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .rmp-route-state {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .rmp-route-target-meta {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .rmp-route-error {
+    grid-row: 3;
+  }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

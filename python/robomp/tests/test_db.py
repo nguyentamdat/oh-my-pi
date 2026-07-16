@@ -407,6 +407,108 @@ def test_routing_decisions_retain_recommendation_and_later_explicit_route(db: Da
     assert human_route.explicit
 
 
+def test_routing_status_is_bounded_and_joins_planned_and_synthetic_children(db: Database) -> None:
+    source = canonical_item_key("gitlab-zingplay", "2080", "issue", 7)
+    assert db.record_event(
+        instance_id="gitlab-zingplay",
+        delivery_id="source-triage-7",
+        event_type="Issue Hook",
+        repo="ica/triage",
+        repository_id="2080",
+        item_kind="issue",
+        item_number=7,
+        canonical_key=source,
+        issue_key=source,
+        payload={"object_kind": "issue"},
+    )
+    db.record_routing_decision(
+        instance_id="gitlab-zingplay",
+        delivery_id="source-triage-7",
+        source_canonical_key=source,
+        ranked_candidates=[
+            {"project_id": 202, "key": "recommendation"},
+            {"project_id": 303, "key": "implementation"},
+        ],
+        selected_target_key=None,
+        selected_project_id=None,
+        explicit=False,
+        action="children_queued",
+        mode="none",
+    )
+    db.plan_routing_children(source, [(202, "recommend"), (303, "auto_implement"), (404, "auto_implement")])
+    db.complete_routing_child_event(
+        source_canonical_key=source,
+        target_project_id=303,
+        target_delivery_id="route:303:19",
+        target_event_type="RoboOMP Route",
+        target_repo="ica/implementation",
+        target_issue_key=canonical_item_key("gitlab-zingplay", "303", "issue", 19),
+        target_payload={"object_kind": "issue"},
+        target_item_kind="issue",
+        target_item_number=19,
+        target_task_kind="triage_issue",
+        target_instance_id="gitlab-zingplay",
+    )
+    native_target = canonical_item_key("gitlab-zingplay", "404", "issue", 20)
+    assert db.record_event(
+        instance_id="gitlab-zingplay",
+        delivery_id="native:404:20",
+        event_type="Issue Hook",
+        canonical_event="issue.updated",
+        task_kind="triage_issue",
+        repo="ica/native-implementation",
+        repository_id="404",
+        item_kind="issue",
+        item_number=20,
+        canonical_key=native_target,
+        issue_key=native_target,
+        payload={"object_kind": "issue"},
+    )
+    db.complete_routing_child_event(
+        source_canonical_key=source,
+        target_project_id=404,
+        target_delivery_id="route:404:20",
+        target_event_type="RoboOMP Route",
+        target_repo="ica/native-implementation",
+        target_issue_key=native_target,
+        target_payload={"object_kind": "issue"},
+        target_item_kind="issue",
+        target_item_number=20,
+        target_task_kind="triage_issue",
+        target_instance_id="gitlab-zingplay",
+    )
+
+    rows = db.list_routing_status()
+
+    assert [row.target_project_id for row in rows] == ["202", "303", "404"]
+    assert all(row.source_repo == "ica/triage" and row.source_number == 7 for row in rows)
+    assert [row.target_state for row in rows] == [None, "queued", "queued"]
+    assert [row.target_attempts for row in rows] == [None, 0, 0]
+    assert rows[1].target_repo == "ica/implementation"
+    assert rows[1].target_task_kind == "triage_issue"
+    assert rows[2].target_delivery_id == "native:404:20"
+    assert rows[2].target_repo == "ica/native-implementation"
+
+    for number in range(25):
+        other_source = canonical_item_key("gitlab-zingplay", str(400 + number), "issue", number)
+        db.record_routing_decision(
+            instance_id="gitlab-zingplay",
+            delivery_id=f"later-decision-{number}",
+            source_canonical_key=other_source,
+            ranked_candidates=[],
+            selected_target_key=None,
+            selected_project_id=None,
+            explicit=False,
+            action="recommend",
+            mode="recommend",
+        )
+        db.plan_routing_children(other_source, [(500 + number, "recommend")])
+
+    bounded = db.list_routing_status()
+    assert len(bounded) == 25
+    assert source not in {row.source_canonical_key for row in bounded}
+
+
 def test_routing_lineage_schema_is_safe_to_reopen(tmp_path: Path) -> None:
     path = tmp_path / "routing.sqlite"
     source = canonical_item_key("gitlab-source", "101", "issue", 7)

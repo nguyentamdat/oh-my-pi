@@ -39,6 +39,7 @@ function status(overrides: Partial<StatusResponse> = {}): StatusResponse {
     inflight: [],
     issues: [],
     recent_events: [],
+    routing_flows: [],
     ...overrides,
   };
 }
@@ -160,7 +161,10 @@ describe("buildWorkItems", () => {
             key: "owner/repo#223",
             number: 223,
             state: "merged",
-            latest_event: latestEvent({ delivery_id: "done-223", state: "done" }),
+            latest_event: latestEvent({
+              delivery_id: "done-223",
+              state: "done",
+            }),
           }),
         ],
         running_events: [
@@ -252,8 +256,12 @@ describe("buildWorkItems", () => {
       }),
     );
 
-    expect(items.some((item) => item.deliveryId === "old-failed-3")).toBe(false);
-    expect(items.filter((item) => item.deliveryId === "failed-4")).toHaveLength(1);
+    expect(items.some((item) => item.deliveryId === "old-failed-3")).toBe(
+      false,
+    );
+    expect(items.filter((item) => item.deliveryId === "failed-4")).toHaveLength(
+      1,
+    );
     expect(items.find((item) => item.deliveryId === "failed-4")).toMatchObject({
       key: "owner/repo#4",
       bucket: "failed",
@@ -591,7 +599,10 @@ describe("buildWorkItems", () => {
       }),
     );
     expect(items).toHaveLength(2);
-    expect(items.map(i => i.deliveryId)).toEqual(["run-valid-ts", "run-invalid-ts"]);
+    expect(items.map((i) => i.deliveryId)).toEqual([
+      "run-valid-ts",
+      "run-invalid-ts",
+    ]);
   });
 
   test("live running event outranks a newer failed latest_event for the same issue", () => {
@@ -724,7 +735,9 @@ describe("buildWorkItems", () => {
         ],
       }),
     );
-    expect(items.some((item) => item.deliveryId === "failed-older-orphan")).toBe(false);
+    expect(
+      items.some((item) => item.deliveryId === "failed-older-orphan"),
+    ).toBe(false);
     expect(items).toEqual([]);
   });
 
@@ -866,5 +879,4 @@ describe("buildWorkItems", () => {
       error: "live failure",
     });
   });
-
 });

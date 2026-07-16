@@ -278,6 +278,31 @@ class RoutingDecisionRow:
 
 
 @dataclass(slots=True, frozen=True)
+class RoutingStatusRow:
+    """One source decision with an optional planned child and its synthetic event."""
+
+    source_canonical_key: str
+    source_repo: str | None
+    source_number: int | None
+    candidates: list[dict[str, Any]]
+    explicit: bool
+    action: str
+    created_at: str
+    target_project_id: str | None
+    target_mode: str | None
+    target_canonical_key: str | None
+    target_delivery_id: str | None
+    target_repo: str | None
+    target_number: int | None
+    target_task_kind: str | None
+    target_state: EventState | None
+    target_attempts: int | None
+    target_last_error: str | None
+    target_started_at: str | None
+    target_finished_at: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class IssueRow:
     key: str
     repo: str
@@ -1634,6 +1659,116 @@ class Database:
                 action=row["action"],
                 mode=row["mode"],
                 created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def list_routing_status(self, *, limit: int = 25) -> list[RoutingStatusRow]:
+        """Return newest source decisions with planned children and synthetic event state."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                WITH ranked_decisions AS (
+                  SELECT
+                    rd.rowid AS decision_rowid,
+                    rd.instance_id,
+                    rd.delivery_id,
+                    rd.source_canonical_key,
+                    rd.candidates_json,
+                    rd.explicit,
+                    rd.action,
+                    rd.created_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY rd.source_canonical_key
+                      ORDER BY rd.created_at DESC, rd.rowid DESC
+                    ) AS source_rank
+                  FROM routing_decisions AS rd
+                  WHERE EXISTS (
+                    SELECT 1
+                    FROM routing_children AS planned_child
+                    WHERE planned_child.source_canonical_key=rd.source_canonical_key
+                  )
+                ),
+                latest_decisions AS (
+                  SELECT *
+                  FROM ranked_decisions
+                  WHERE source_rank=1
+                  ORDER BY created_at DESC, decision_rowid DESC
+                  LIMIT ?
+                )
+                SELECT
+                  decision.source_canonical_key,
+                  source_event.repo AS source_repo,
+                  source_event.item_number AS source_number,
+                  decision.candidates_json,
+                  decision.explicit,
+                  decision.action,
+                  decision.created_at,
+                  child.target_project_id,
+                  child.mode AS target_mode,
+                  child.target_canonical_key,
+                  target_event.delivery_id AS target_delivery_id,
+                  target_event.repo AS target_repo,
+                  target_event.item_number AS target_number,
+                  target_event.task_kind AS target_task_kind,
+                  target_event.state AS target_state,
+                  target_event.attempts AS target_attempts,
+                  target_event.last_error AS target_last_error,
+                  target_event.started_at AS target_started_at,
+                  target_event.finished_at AS target_finished_at
+                FROM latest_decisions AS decision
+                LEFT JOIN events AS source_event
+                  ON source_event.instance_id=decision.instance_id
+                 AND source_event.delivery_id=decision.delivery_id
+                LEFT JOIN routing_children AS child
+                  ON child.source_canonical_key=decision.source_canonical_key
+                LEFT JOIN events AS target_event
+                  ON target_event.instance_id=decision.instance_id
+                 AND target_event.delivery_id=COALESCE(
+                   (
+                     SELECT effective_event.delivery_id
+                     FROM events AS effective_event
+                     WHERE effective_event.instance_id=decision.instance_id
+                       AND effective_event.canonical_key=child.target_canonical_key
+                       AND effective_event.task_kind='triage_issue'
+                       AND effective_event.state <> 'skipped'
+                     ORDER BY
+                       effective_event.received_at DESC
+                     LIMIT 1
+                   ),
+                   child.target_delivery_id
+                 )
+                ORDER BY
+                  decision.created_at DESC,
+                  decision.decision_rowid DESC,
+                  CAST(child.target_project_id AS INTEGER),
+                  child.target_project_id
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            RoutingStatusRow(
+                source_canonical_key=row["source_canonical_key"],
+                source_repo=row["source_repo"],
+                source_number=row["source_number"],
+                candidates=json.loads(row["candidates_json"]),
+                explicit=bool(row["explicit"]),
+                action=row["action"],
+                created_at=row["created_at"],
+                target_project_id=row["target_project_id"],
+                target_mode=row["target_mode"],
+                target_canonical_key=row["target_canonical_key"],
+                target_delivery_id=row["target_delivery_id"],
+                target_repo=row["target_repo"],
+                target_number=row["target_number"],
+                target_task_kind=row["target_task_kind"],
+                target_state=row["target_state"],
+                target_attempts=row["target_attempts"],
+                target_last_error=row["target_last_error"],
+                target_started_at=row["target_started_at"],
+                target_finished_at=row["target_finished_at"],
             )
             for row in rows
         ]

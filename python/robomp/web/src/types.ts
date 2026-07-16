@@ -70,6 +70,34 @@ export interface RecentEvent {
   issue_state: IssueState | null;
 }
 
+export interface RoutingTarget {
+  key: string | null;
+  project_id: string;
+  mode: string;
+  canonical_key: string | null;
+  repo: string | null;
+  number: number | null;
+  url: string | null;
+  delivery_id: string | null;
+  task_kind: string | null;
+  state: "planned" | EventState;
+  attempts: number;
+  last_error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface RoutingFlow {
+  source_key: string;
+  source_repo: string | null;
+  source_number: number | null;
+  source_url: string | null;
+  action: string;
+  explicit: boolean;
+  created_at: string;
+  targets: RoutingTarget[];
+}
+
 export interface StatusResponse {
   runtime: RuntimeInfo;
   event_counts: Record<EventState, number>;
@@ -78,6 +106,7 @@ export interface StatusResponse {
   inflight: string[];
   issues: IssueRow[];
   recent_events: RecentEvent[];
+  routing_flows: RoutingFlow[];
 }
 
 // Log entries carry arbitrary structured extras. We expose the known fields

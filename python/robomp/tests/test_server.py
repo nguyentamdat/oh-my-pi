@@ -6,11 +6,13 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from unittest.mock import ANY
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import robomp.dashboard as dashboard
 from robomp.config import Settings, reset_settings_cache
 from robomp.dashboard import tail_jsonl
 from robomp.db import Database, EventRow, close_database, get_database, issue_key
@@ -92,6 +94,51 @@ def test_index_substitutes_replay_token(env, monkeypatch: pytest.MonkeyPatch) ->
         assert '"replayEnabled":true' in resp.text
         assert '"replayToken":"secret-token-7"' in resp.text
     finally:
+        close_database()
+
+
+def test_index_rewrites_assets_for_dashboard_base_path(
+    env,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ROBOMP_DASHBOARD_BASE_PATH", "/robomp/")
+    monkeypatch.setenv("ROBOMP_REPLAY_TOKEN", "/static/dashboard-secret")
+    static = tmp_path / "static"
+    assets = static / "assets"
+    assets.mkdir(parents=True)
+    (assets / "app.js").write_text("export {};", encoding="utf-8")
+    (assets / "app.css").write_text("body {}", encoding="utf-8")
+    index = static / "index.html"
+    index.write_text(
+        '<script type="module" src="/static/assets/app.js"></script>'
+        '<link rel="stylesheet" href="/static/assets/app.css">'
+        '<script id="robomp-config" type="application/json">__ROBOMP_CONFIG__</script>',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dashboard, "_STATIC_DIR", static)
+    monkeypatch.setattr(dashboard, "_INDEX_PATH", index)
+    dashboard.reset_index_cache()
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    try:
+        with TestClient(app) as client:
+            response = client.get("/")
+            script_url = response.text.split('src="', 1)[1].split('"', 1)[0]
+            stylesheet_url = response.text.split('href="/robomp/static/', 1)[1].split('"', 1)[0]
+            script_response = client.get(script_url.removeprefix("/robomp"))
+            stylesheet_response = client.get(f"/static/{stylesheet_url}")
+
+        assert response.status_code == 200
+        assert '"basePath":"/robomp"' in response.text
+        assert '"replayToken":"/static/dashboard-secret"' in response.text
+        assert script_url.startswith("/robomp/static/")
+        assert script_response.status_code == 200
+        assert stylesheet_response.status_code == 200
+    finally:
+        dashboard.reset_index_cache()
         close_database()
 
 
@@ -195,6 +242,103 @@ def test_api_status_reports_current_issue_event_state(settings: Settings) -> Non
     assert issues[fixed]["latest_event"]["state"] == "done"
     assert issues[failed]["latest_event"]["delivery_id"] == "still-failed"
     assert issues[failed]["latest_event"]["state"] == "failed"
+
+
+def test_api_status_reports_routing_flows(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = _gitlab_settings(monkeypatch, env)
+    source = "gitlab-zingplay:2080:issue:7"
+    with TestClient(create_app(cfg)) as client:
+        db = get_database(cfg.sqlite_path)
+        db.record_event(
+            instance_id="gitlab-zingplay",
+            delivery_id="source-triage-7",
+            event_type="Issue Hook",
+            repo="ica/triage",
+            repository_id="2080",
+            item_kind="issue",
+            item_number=7,
+            canonical_key=source,
+            issue_key=source,
+            payload={"object_kind": "issue"},
+            state="done",
+        )
+        db.record_routing_decision(
+            instance_id="gitlab-zingplay",
+            delivery_id="source-triage-7",
+            source_canonical_key=source,
+            ranked_candidates=[
+                {"project_id": 332, "key": "client"},
+                {"project_id": 356, "key": "server"},
+            ],
+            selected_target_key=None,
+            selected_project_id=None,
+            explicit=False,
+            action="children_queued",
+            mode="none",
+        )
+        db.plan_routing_children(source, [(332, "recommend"), (356, "auto_implement")])
+        db.complete_routing_child_event(
+            source_canonical_key=source,
+            target_project_id=356,
+            target_delivery_id="route:356:19",
+            target_event_type="RoboOMP Route",
+            target_repo="ica/server",
+            target_issue_key="gitlab-zingplay:356:issue:19",
+            target_payload={"object_kind": "issue"},
+            target_item_kind="issue",
+            target_item_number=19,
+            target_task_kind="triage_issue",
+            target_instance_id="gitlab-zingplay",
+        )
+        response = client.get("/api/status")
+    close_database()
+
+    assert response.status_code == 200
+    assert response.json()["routing_flows"] == [
+        {
+            "source_key": source,
+            "source_repo": "ica/triage",
+            "source_number": 7,
+            "source_url": "https://gitlab.zingplay.com/ica/triage/-/issues/7",
+            "action": "children_queued",
+            "explicit": False,
+            "created_at": ANY,
+            "targets": [
+                {
+                    "key": "client",
+                    "project_id": "332",
+                    "mode": "recommend",
+                    "canonical_key": None,
+                    "repo": None,
+                    "number": None,
+                    "url": None,
+                    "delivery_id": None,
+                    "task_kind": None,
+                    "state": "planned",
+                    "attempts": 0,
+                    "last_error": None,
+                    "started_at": None,
+                    "finished_at": None,
+                },
+                {
+                    "key": "server",
+                    "project_id": "356",
+                    "mode": "auto_implement",
+                    "canonical_key": "gitlab-zingplay:356:issue:19",
+                    "repo": "ica/server",
+                    "number": 19,
+                    "url": "https://gitlab.zingplay.com/ica/server/-/issues/19",
+                    "delivery_id": "route:356:19",
+                    "task_kind": "triage_issue",
+                    "state": "queued",
+                    "attempts": 0,
+                    "last_error": None,
+                    "started_at": None,
+                    "finished_at": None,
+                },
+            ],
+        }
+    ]
 
 
 def test_api_logs_returns_empty_when_file_missing(settings: Settings) -> None:

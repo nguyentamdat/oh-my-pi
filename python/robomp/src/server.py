@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -23,6 +24,7 @@ from robomp.db import (
     INACTIVE_EVENT_STATES,
     Database,
     EventRow,
+    RoutingStatusRow,
     canonical_item_key,
     get_database,
     iso_seconds_ago,
@@ -50,6 +52,72 @@ from robomp.routing_llm import RoutingLLMClassifier
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
+
+
+def _gitlab_issue_url(base_url: str | None, repo: str | None, number: int | None) -> str | None:
+    """Build a credential-free GitLab issue URL from persisted issue identity."""
+    if base_url is None or repo is None or number is None:
+        return None
+    parsed = urlsplit(base_url)
+    if not parsed.scheme or parsed.hostname is None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname if port is None else f"{hostname}:{port}"
+    path = f"{parsed.path.rstrip('/')}/{quote(repo, safe='/')}/-/issues/{number}"
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
+def _routing_flows_payload(rows: list[RoutingStatusRow], gitlab_base_url: str | None) -> list[dict[str, Any]]:
+    """Aggregate joined routing rows into the dashboard's source-to-child contract."""
+    flows: list[dict[str, Any]] = []
+    flow_by_source: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        flow = flow_by_source.get(row.source_canonical_key)
+        if flow is None:
+            flow = {
+                "source_key": row.source_canonical_key,
+                "source_repo": row.source_repo,
+                "source_number": row.source_number,
+                "source_url": _gitlab_issue_url(gitlab_base_url, row.source_repo, row.source_number),
+                "action": row.action,
+                "explicit": row.explicit,
+                "created_at": row.created_at,
+                "targets": [],
+            }
+            flow_by_source[row.source_canonical_key] = flow
+            flows.append(flow)
+        if row.target_project_id is None:
+            continue
+        candidate = next(
+            (item for item in row.candidates if str(item.get("project_id")) == row.target_project_id),
+            None,
+        )
+        target_key = candidate.get("key") if isinstance(candidate, dict) else None
+        flow["targets"].append(
+            {
+                "key": target_key if isinstance(target_key, str) else None,
+                "project_id": row.target_project_id,
+                "mode": row.target_mode,
+                "canonical_key": row.target_canonical_key,
+                "repo": row.target_repo,
+                "number": row.target_number,
+                "url": _gitlab_issue_url(gitlab_base_url, row.target_repo, row.target_number),
+                "delivery_id": row.target_delivery_id,
+                "task_kind": row.target_task_kind,
+                "state": row.target_state or "planned",
+                "attempts": row.target_attempts or 0,
+                "last_error": row.target_last_error,
+                "started_at": row.target_started_at,
+                "finished_at": row.target_finished_at,
+            }
+        )
+    return flows
 
 
 @dataclass(slots=True)
@@ -1031,6 +1099,7 @@ def create_app(
     @app.get("/events")
     async def events(request: Request, limit: int = 50) -> dict[str, Any]:
         rows = request.app.state.bag["db"].list_events(limit=limit)
+
         return {
             "events": [
                 {
@@ -1070,7 +1139,7 @@ def create_app(
     async def index(request: Request) -> HTMLResponse:
         cfg: Settings = request.app.state.bag["settings"]
         token = cfg.replay_token.get_secret_value() if cfg.replay_token else None
-        return HTMLResponse(render_index(token))
+        return HTMLResponse(render_index(token, cfg.dashboard_base_path))
 
     @app.get("/api/status")
     async def api_status(request: Request) -> dict[str, Any]:
@@ -1088,6 +1157,7 @@ def create_app(
             # /healthz — which is how the dashboard ends up "never loading".
             issues_rows = db.list_issues(limit=200)
             latest_events = db.latest_events_for_issues(r.key for r in issues_rows)
+            routing_flows = _routing_flows_payload(db.list_routing_status(), cfg.gitlab_base_url)
 
             def _latest_event_payload(key: str) -> dict[str, Any] | None:
                 latest = latest_events.get(key)
@@ -1152,6 +1222,7 @@ def create_app(
                     }
                     for r in events_rows
                 ],
+                "routing_flows": routing_flows,
             }
 
         collected = await asyncio.to_thread(_collect)

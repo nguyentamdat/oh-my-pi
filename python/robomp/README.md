@@ -80,10 +80,23 @@ roboomp's `Dockerfile.robomp` extends via `FROM ${PI_BASE}`.
 
 ### Public URL
 
-roboomp does not ship a tunnel. Cloudflare, smee, ngrok are all fine. The
-recommended ingress rule exposes only configured webhook routes:
-`/webhook/github` and/or `/webhook/gitlab-zingplay`. `/healthz`, `/events`,
-`/issues`, `/replay`, and `/api/*` stay localhost-only.
+roboomp does not ship a public tunnel. Cloudflare, smee, and ngrok are all
+fine for webhook delivery, but the public ingress should expose only configured
+webhook routes: `/webhook/github` and/or `/webhook/gitlab-zingplay`.
+`/healthz`, `/events`, `/issues`, `/replay`, and `/api/*` stay private.
+
+The production GitOps deployment exposes the bundled operations dashboard only
+inside the tailnet at:
+
+```text
+https://homeserver.taile2a15.ts.net/robomp/
+```
+
+Traefik redirects `/robomp` to the trailing-slash URL, strips the prefix before
+forwarding to FastAPI, and keeps the public `robomp.bongsenlen.io.vn` host
+webhook-only. The dashboard groups each recent intake source with its ordered
+target children, mode, target issue link, worker state, attempts, timing, and
+latest error.
 
 ### GitHub webhook
 

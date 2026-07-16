@@ -112,8 +112,8 @@ def reset_index_cache() -> None:
     _load_index_template.cache_clear()
 
 
-def render_index(replay_token: str | None) -> str:
-    """Render the dashboard HTML with the server's replay token baked in.
+def render_index(replay_token: str | None, base_path: str = "") -> str:
+    """Render dashboard HTML with runtime auth and reverse-proxy path config.
 
     The token lands inside a `<script type="application/json">` block that the
     page parses at startup and attaches to every privileged fetch. The user
@@ -123,11 +123,15 @@ def render_index(replay_token: str | None) -> str:
     config = {
         "replayEnabled": bool(replay_token),
         "replayToken": replay_token or "",
+        "basePath": base_path,
     }
     # `</` would otherwise let an attacker-controlled token break out of the
     # script element; escape it the standard way.
     payload = json.dumps(config, separators=(",", ":")).replace("</", "<\\/")
-    return _load_index_template().replace(_CONFIG_SENTINEL, payload)
+    html = _load_index_template()
+    if base_path:
+        html = html.replace('"/static/', f'"{base_path}/static/')
+    return html.replace(_CONFIG_SENTINEL, payload)
 
 
 __all__ = [
