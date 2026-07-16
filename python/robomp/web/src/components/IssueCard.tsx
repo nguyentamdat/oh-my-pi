@@ -31,7 +31,11 @@ export function IssueCard(props: IssueCardProps): JSX.Element {
         <div class="rmp-card-head">
           <div class="rmp-card-id">
             <Pill>{item().classification ?? "issue"}</Pill>
-            <IssueLink repo={ref()!.repo} number={String(ref()!.number)} />
+            <IssueLink
+              repo={ref()!.repo}
+              number={String(ref()!.number)}
+              href={ref()!.url}
+            />
           </div>
           <ActivityPill item={item()} />
         </div>
@@ -59,13 +63,27 @@ export function IssueCard(props: IssueCardProps): JSX.Element {
           <Show when={item().bucket === "failed" && item().deliveryId}>
             <button
               class="tiny"
-              onClick={() => void runTrigger({ mode: "retry", delivery_id: item().deliveryId })}
+              onClick={() =>
+                void runTrigger({
+                  mode: "retry",
+                  delivery_id: item().deliveryId,
+                })
+              }
             >
               retry
             </button>
           </Show>
-          <Show when={item().bucket === "running" && item().live !== null && item().deliveryId}>
-            <button class="tiny danger" onClick={() => void cancel(item().deliveryId)}>
+          <Show
+            when={
+              item().bucket === "running" &&
+              item().live !== null &&
+              item().deliveryId
+            }
+          >
+            <button
+              class="tiny danger"
+              onClick={() => void cancel(item().deliveryId)}
+            >
               cancel
             </button>
           </Show>
@@ -88,10 +106,15 @@ function CompactHead(props: { item: WorkItem }): JSX.Element {
 
 function ActivityPill(props: { item: WorkItem }): JSX.Element {
   const state = (): string | undefined =>
-    props.item.latestEvent?.state ?? (props.item.bucket === "running" ? "running" : undefined);
+    props.item.latestEvent?.state ??
+    (props.item.bucket === "running" ? "running" : undefined);
   const label = (): string =>
     props.item.latestEvent?.state ??
-    (props.item.bucket === "running" ? (props.item.inflightOnly ? "inflight" : "running") : "—");
+    (props.item.bucket === "running"
+      ? props.item.inflightOnly
+        ? "inflight"
+        : "running"
+      : "—");
   return (
     <Pill state={state()} dot={props.item.bucket === "running"}>
       {label()}
@@ -114,7 +137,9 @@ function MetaRow(props: { item: WorkItem }): JSX.Element {
         <Show when={live()!.last_tool}>
           <span>
             last action <code>{live()!.last_tool}</code>{" "}
-            <span class="rmp-card-meta-dim">{fmtAge(live()!.last_tool_ts)}</span>
+            <span class="rmp-card-meta-dim">
+              {fmtAge(live()!.last_tool_ts)}
+            </span>
           </span>
         </Show>
         <span>
@@ -129,7 +154,11 @@ function MetaRow(props: { item: WorkItem }): JSX.Element {
         <code>{item().branch}</code>
       </Show>
       <Show when={item().ref && item().prNumber != null}>
-        <PrLink repo={item().ref!.repo} number={item().prNumber} />
+        <PrLink
+          repo={item().ref!.repo}
+          number={item().prNumber}
+          href={item().prUrl}
+        />
       </Show>
       <Show
         when={
@@ -139,7 +168,8 @@ function MetaRow(props: { item: WorkItem }): JSX.Element {
         }
       >
         <span>
-          {item().latestEvent!.event_type} · attempt #{item().latestEvent!.attempts} ·{" "}
+          {item().latestEvent!.event_type} · attempt #
+          {item().latestEvent!.attempts} ·{" "}
           {fmtAge(item().latestEvent!.received_at)}
         </span>
       </Show>

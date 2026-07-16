@@ -180,6 +180,8 @@ def test_api_status_reports_runtime_counts_and_inflight(settings: Settings) -> N
     assert issues[fix_key]["classification"] == "bug"
     assert issues[fix_key]["pr_number"] == 42
     assert issues[fix_key]["branch"] == "farm/abc12345/fix"
+    assert issues[fix_key]["url"] == "https://github.com/octo/widget/issues/3"
+    assert issues[fix_key]["pr_url"] == "https://github.com/octo/widget/pull/42"
 
     delivery_ids = {e["delivery_id"] for e in body["recent_events"]}
     assert {"d-queued", "d-skipped", "d-running"}.issubset(delivery_ids)
@@ -290,10 +292,22 @@ def test_api_status_reports_routing_flows(env, monkeypatch: pytest.MonkeyPatch) 
             target_task_kind="triage_issue",
             target_instance_id="gitlab-zingplay",
         )
+        db.upsert_issue(
+            key="gitlab-zingplay:356:issue:19",
+            repo="ica/server",
+            number=19,
+            state="opened",
+            pr_number=77,
+        )
         response = client.get("/api/status")
     close_database()
 
     assert response.status_code == 200
+    issues = {item["key"]: item for item in response.json()["issues"]}
+    assert issues["gitlab-zingplay:356:issue:19"]["url"] == ("https://gitlab.zingplay.com/ica/server/-/issues/19")
+    assert issues["gitlab-zingplay:356:issue:19"]["pr_url"] == (
+        "https://gitlab.zingplay.com/ica/server/-/merge_requests/77"
+    )
     assert response.json()["routing_flows"] == [
         {
             "source_key": source,

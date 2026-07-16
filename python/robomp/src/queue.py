@@ -364,6 +364,17 @@ class WorkerPool:
 
     async def _dispatch_and_mark(self, row: EventRow, *, slot_uid: int | None = None) -> None:
         await self._dispatch(row, slot_uid=slot_uid)
+        if row.task_kind == "triage_issue":
+            issue = self.db.get_issue(row.issue_key)
+            if issue is not None and issue.state in {"new", "reproducing", "fixing"}:
+                last_error = self.db.latest_tool_error(
+                    row.issue_key,
+                    since=row.started_at or row.received_at,
+                )
+                detail = f"; last tool error: {last_error[0]}: {last_error[1]}" if last_error else ""
+                raise RuntimeError(
+                    f"triage completed without an implementation outcome; issue remains {issue.state}{detail}"
+                )
         if row.dispatch_id in self._cancelled:
             self.db.mark_event(
                 row.delivery_id,

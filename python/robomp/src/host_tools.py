@@ -620,6 +620,15 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
             if scheduled_at is not None:
                 audit_result["scheduled_close_at"] = scheduled_at
         _audit(bindings, "forge_post_comment", args, result=audit_result)
+        issue = bindings.db.get_issue(bindings.issue_key)
+        if (
+            target_number == bindings.issue.number
+            and issue is not None
+            and issue.classification is not None
+            and issue.classification not in _AUTO_PR_CLASSIFICATIONS
+            and not bindings.impl_authorized
+        ):
+            bindings.db.set_issue_state(bindings.issue_key, "responded")
         return f"comment posted: id={comment.id}"
 
     return host_tool(
@@ -1690,6 +1699,9 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
             priority = None
         branch_slug = args.get("branch_slug")
         if isinstance(branch_slug, str) and branch_slug.strip():
+            branch_prefix, separator, _ = bindings.workspace.branch.rpartition("/")
+            if separator and branch_slug.startswith(f"{branch_prefix}/"):
+                branch_slug = branch_slug.removeprefix(f"{branch_prefix}/")
             try:
                 branch_slug = validate_branch_slug(branch_slug)
             except ValueError as exc:

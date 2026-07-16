@@ -13,7 +13,8 @@ export type IssueState =
   | "merged"
   | "closed"
   | "needs_info"
-  | "abandoned";
+  | "abandoned"
+  | "responded";
 
 export interface RuntimeInfo {
   bot_login: string;
@@ -36,8 +37,10 @@ export interface LatestEvent {
 export interface IssueRow {
   key: string;
   repo: string;
+  url?: string | null;
   number: number;
   branch: string | null;
+  pr_url?: string | null;
   pr_number: number | null;
   state: IssueState;
   classification: string | null;
@@ -174,6 +177,7 @@ export const TERMINAL_ISSUE_STATES: ReadonlySet<string> = new Set([
   "merged",
   "closed",
   "abandoned",
+  "responded",
 ]);
 
 export const LEVEL_ORDER: Readonly<Record<string, number>> = {

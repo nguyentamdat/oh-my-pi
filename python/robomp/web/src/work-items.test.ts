@@ -136,6 +136,34 @@ describe("buildWorkItems", () => {
     expect(items[0].live?.delivery_id).toBe("delivery-7");
   });
 
+  test("preserves forge-specific issue and change URLs", () => {
+    const [item] = buildWorkItems(
+      status({
+        issues: [
+          issue({
+            key: "gitlab-zingplay:356:issue:7",
+            repo: "ica/server",
+            number: 7,
+            url: "https://gitlab.zingplay.com/ica/server/-/issues/7",
+            pr_number: 77,
+            pr_url:
+              "https://gitlab.zingplay.com/ica/server/-/merge_requests/77",
+            state: "opened",
+          }),
+        ],
+      }),
+    );
+
+    expect(item.ref).toEqual({
+      repo: "ica/server",
+      number: 7,
+      url: "https://gitlab.zingplay.com/ica/server/-/issues/7",
+    });
+    expect(item.prUrl).toBe(
+      "https://gitlab.zingplay.com/ica/server/-/merge_requests/77",
+    );
+  });
+
   test("excludes terminal issues", () => {
     const items = buildWorkItems(
       status({

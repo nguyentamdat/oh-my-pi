@@ -28,6 +28,7 @@ IssueState = Literal[
     "closed",
     "needs_info",
     "abandoned",
+    "responded",
 ]
 
 SCHEMA = """
@@ -207,6 +208,7 @@ class EventRow:
     state: EventState
     attempts: int
     last_error: str | None
+    started_at: str | None = None
     instance_id: str = DEFAULT_GITHUB_INSTANCE
     repository_id: str | None = None
     item_kind: str | None = None
@@ -339,6 +341,7 @@ def _event_row_from_db_row(row: sqlite3.Row) -> EventRow:
         state=row["state"],
         attempts=int(row["attempts"]),
         last_error=row["last_error"],
+        started_at=row["started_at"],
         instance_id=row["instance_id"],
         repository_id=row["repository_id"],
         item_kind=row["item_kind"],
@@ -676,7 +679,22 @@ class Database:
                     last_error,
                 ),
             )
-            return cur.rowcount > 0
+            inserted = cur.rowcount > 0
+            if (
+                inserted
+                and state == "queued"
+                and task_kind in {"triage_issue", "handle_comment"}
+                and (issue_key is not None or canonical_key is not None)
+            ):
+                self._conn.execute(
+                    """
+                    UPDATE issues
+                    SET state='new', updated_at=?
+                    WHERE state='responded' AND (key=? OR key=?)
+                    """,
+                    (now, issue_key, canonical_key),
+                )
+            return inserted
 
     def claim_next_event(self) -> EventRow | None:
         """Atomically dequeue one canonically-unblocked queued event."""
@@ -727,6 +745,7 @@ class Database:
                 state="running",
                 attempts=int(row["attempts"]) + 1,
                 last_error=row["last_error"],
+                started_at=now,
                 instance_id=row["instance_id"],
                 repository_id=row["repository_id"],
                 item_kind=row["item_kind"],
@@ -781,7 +800,7 @@ class Database:
                 """
                 SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
                        repo, repository_id, item_kind, item_number, canonical_key,
-                       issue_key, payload_json, received_at, state, attempts, last_error
+                       issue_key, payload_json, received_at, started_at, state, attempts, last_error
                 FROM events
                 ORDER BY received_at DESC
                 LIMIT ?
@@ -872,7 +891,7 @@ class Database:
                 f"""
                 SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
                        repo, repository_id, item_kind, item_number, canonical_key,
-                       issue_key, payload_json, received_at, state, attempts, last_error
+                       issue_key, payload_json, received_at, started_at, state, attempts, last_error
                 FROM events
                 WHERE issue_key = ?
                   {state_filter}
@@ -905,7 +924,7 @@ class Database:
                     f"""
                     SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
                            repo, repository_id, item_kind, item_number, canonical_key,
-                           issue_key, payload_json, received_at, state, attempts, last_error
+                           issue_key, payload_json, received_at, started_at, state, attempts, last_error
                     FROM events
                     WHERE issue_key IN ({placeholders})
                       {state_filter}
@@ -1010,7 +1029,7 @@ class Database:
                 """
                 SELECT instance_id, delivery_id, event_type, canonical_event, task_kind,
                        repo, repository_id, item_kind, item_number, canonical_key,
-                       issue_key, payload_json, received_at, state, attempts, last_error
+                       issue_key, payload_json, received_at, started_at, state, attempts, last_error
                 FROM events
                 WHERE instance_id=? AND delivery_id=?
                 """,
@@ -2049,6 +2068,20 @@ class Database:
                 (issue_key, tool),
             ).fetchone()
         return row is not None
+
+    def latest_tool_error(self, issue_key: str, *, since: str) -> tuple[str, str] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT tool, error
+                FROM tool_calls
+                WHERE issue_key=? AND error IS NOT NULL AND ts >= ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (issue_key, since),
+            ).fetchone()
+        return (str(row["tool"]), str(row["error"])) if row is not None else None
 
     # ---- PR review comment staging ----
     def stage_review_comment(

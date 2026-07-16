@@ -11,12 +11,13 @@ export type WorkBucket = "failed" | "running" | "queued" | "active";
 
 export interface WorkItem {
   key: string;
-  ref: { repo: string; number: number } | null;
+  ref: { repo: string; number: number; url?: string | null } | null;
   deliveryId: string;
   issueState: string | null;
   classification: string | null;
   branch: string | null;
   prNumber: number | null;
+  prUrl: string | null;
   latestEvent: LatestEvent | null;
   live: RunningEvent | null;
   inflightOnly: boolean;
@@ -25,7 +26,13 @@ export interface WorkItem {
   sortTs: number;
 }
 
-export const CODE_STAGES = ["new", "reproducing", "fixing", "PR", "done"] as const;
+export const CODE_STAGES = [
+  "new",
+  "reproducing",
+  "fixing",
+  "PR",
+  "done",
+] as const;
 export const SIMPLE_STAGES = ["triaged", "resolved"] as const;
 export const SIMPLE_CLASSIFICATIONS: ReadonlySet<string> = new Set([
   "question",
@@ -45,6 +52,7 @@ const STATE_ORDINAL: Record<string, number> = {
   merged: 4,
   closed: 4,
   abandoned: 4,
+  responded: 4,
 };
 
 const BUCKET_RANK: Record<WorkBucket, number> = {
@@ -55,7 +63,7 @@ const BUCKET_RANK: Record<WorkBucket, number> = {
 };
 
 export function stageOrdinal(state: string | null): number {
-  return state ? STATE_ORDINAL[state] ?? 0 : 0;
+  return state ? (STATE_ORDINAL[state] ?? 0) : 0;
 }
 
 export function buildWorkItems(status: StatusResponse): WorkItem[] {
@@ -88,18 +96,21 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
     if (live) {
       items.push({
         key,
-        ref: { repo: issue.repo, number: issue.number },
+        ref: { repo: issue.repo, number: issue.number, url: issue.url ?? null },
         deliveryId: live.delivery_id,
         issueState: issue.state,
         classification: issue.classification,
         branch: issue.branch,
         prNumber: issue.pr_number,
+        prUrl: issue.pr_url ?? null,
         latestEvent: latestEventFromRunning(live),
         live,
         inflightOnly: false,
         bucket: "running",
         error: null,
-        sortTs: parseTs(live.started_at ?? live.received_at ?? issue.updated_at),
+        sortTs: parseTs(
+          live.started_at ?? live.received_at ?? issue.updated_at,
+        ),
       });
       continue;
     }
@@ -116,13 +127,14 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
 
     items.push({
       key,
-      ref: { repo: issue.repo, number: issue.number },
+      ref: { repo: issue.repo, number: issue.number, url: issue.url ?? null },
       deliveryId: latest?.delivery_id ?? "",
       issueState: issue.state,
       classification: issue.classification,
       branch: issue.branch,
       prNumber: issue.pr_number,
       latestEvent: latest,
+      prUrl: issue.pr_url ?? null,
       live: null,
       inflightOnly,
       bucket,
@@ -150,31 +162,47 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
     const eventTs = parseTs(event.received_at);
     const currentTs = current ? parseTs(current.received_at) : 0;
     const nonFailedBreaksTie =
-      current != null && eventTs === currentTs && current.state === "failed" && event.state !== "failed";
+      current != null &&
+      eventTs === currentTs &&
+      current.state === "failed" &&
+      event.state !== "failed";
     if (!current || eventTs > currentTs || nonFailedBreaksTie) {
       newestRecentByKey.set(event.issue_key, event);
     }
   }
 
   for (const event of status.recent_events) {
-    if (event.state !== "failed" || !event.delivery_id || seen.has(event.delivery_id)) continue;
+    if (
+      event.state !== "failed" ||
+      !event.delivery_id ||
+      seen.has(event.delivery_id)
+    )
+      continue;
     // Suppress failures for issues that have since gone terminal
     // (merged/closed/abandoned). For issues outside the capped `status.issues`
     // window there is no row to consult, so the event's own issue_state — the
     // current DB state attached by /api/status — is the only authority. This
     // skip only drops the terminal event itself; it never marks the issue_key
     // as seen, so a retryable failure for any other issue is untouched.
-    if (event.issue_state && TERMINAL_ISSUE_STATES.has(event.issue_state)) continue;
+    if (event.issue_state && TERMINAL_ISSUE_STATES.has(event.issue_state))
+      continue;
     if (event.issue_key) {
       const latest = issueByKey.get(event.issue_key)?.latest_event;
-      if (latest && (latest.delivery_id !== event.delivery_id || latest.state !== "failed")) {
+      if (
+        latest &&
+        (latest.delivery_id !== event.delivery_id || latest.state !== "failed")
+      ) {
         continue;
       }
       // For issues outside the capped `status.issues` window, fall back to the
       // newest recent event for this issue_key. If a newer (or non-failed)
       // delivery exists for the same issue, this older failed orphan is stale.
       const newestRecent = newestRecentByKey.get(event.issue_key);
-      if (newestRecent && (newestRecent.delivery_id !== event.delivery_id || newestRecent.state !== "failed")) {
+      if (
+        newestRecent &&
+        (newestRecent.delivery_id !== event.delivery_id ||
+          newestRecent.state !== "failed")
+      ) {
         continue;
       }
       if (seen.has(event.issue_key)) continue;
@@ -189,6 +217,7 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
       classification: null,
       branch: null,
       prNumber: null,
+      prUrl: null,
       latestEvent: latestEventFromRecent(event),
       live: null,
       inflightOnly: false,
@@ -198,7 +227,10 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
     });
   }
 
-  items.sort((a, b) => BUCKET_RANK[a.bucket] - BUCKET_RANK[b.bucket] || b.sortTs - a.sortTs);
+  items.sort(
+    (a, b) =>
+      BUCKET_RANK[a.bucket] - BUCKET_RANK[b.bucket] || b.sortTs - a.sortTs,
+  );
   return items;
 }
 
@@ -207,7 +239,11 @@ export function buildWorkItems(status: StatusResponse): WorkItem[] {
 // or an issue-shaped inflight entry. Recover the ref via splitRef so the card
 // can still link to the issue; splitRef returns null when the `#N` suffix is
 // missing or non-numeric (e.g. a bare delivery-id key), keeping ref: null.
-function orphanLiveItem(key: string, event: RunningEvent | null, inflightOnly: boolean): WorkItem {
+function orphanLiveItem(
+  key: string,
+  event: RunningEvent | null,
+  inflightOnly: boolean,
+): WorkItem {
   return {
     key,
     ref: key.includes("#") ? splitRef(key) : null,
@@ -217,6 +253,7 @@ function orphanLiveItem(key: string, event: RunningEvent | null, inflightOnly: b
     branch: null,
     prNumber: null,
     latestEvent: null,
+    prUrl: null,
     live: event,
     inflightOnly,
     bucket: "running",
@@ -255,7 +292,9 @@ function parseTs(value: string | null | undefined): number {
   return Number.isNaN(time) ? 0 : time;
 }
 
-function splitRef(issueKey: string | null): { repo: string; number: number } | null {
+function splitRef(
+  issueKey: string | null,
+): { repo: string; number: number } | null {
   if (!issueKey) return null;
   const ref = splitIssueKey(issueKey);
   const number = Number(ref.number);

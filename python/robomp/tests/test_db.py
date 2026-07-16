@@ -29,6 +29,33 @@ def test_record_event_dedupes_by_delivery(db: Database) -> None:
     )
 
 
+def test_new_comment_reactivates_responded_issue_once(db: Database) -> None:
+    key = issue_key("octo/widget", 1)
+    db.upsert_issue(key=key, repo="octo/widget", number=1, state="responded")
+    payload = {"action": "created", "issue": {"number": 1}}
+
+    assert db.record_event(
+        delivery_id="follow-up",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key=key,
+        payload=payload,
+    )
+    issue = db.get_issue(key)
+    assert issue is not None and issue.state == "new"
+
+    db.set_issue_state(key, "responded")
+    assert not db.record_event(
+        delivery_id="follow-up",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key=key,
+        payload=payload,
+    )
+    issue = db.get_issue(key)
+    assert issue is not None and issue.state == "responded"
+
+
 def _record_routing_lineage_event(
     db: Database,
     *,

@@ -74,6 +74,8 @@ def test_schedule_retry_gates_claim_until_available(db: Database) -> None:
     _record(db)
     claimed = db.claim_next_event()
     assert claimed is not None and claimed.attempts == 1
+    assert claimed.started_at is not None
+    assert db.get_event("d1").started_at == claimed.started_at
 
     assert db.schedule_retry("d1", delay_seconds=3600, error="ephemeral boom")
     ev = db.get_event("d1")
@@ -216,3 +218,77 @@ async def test_run_event_success_after_transient_failure(
     await pool._run_event(row2)
     assert db.get_event("d1").state == "done"
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_triage_run_retries_when_issue_remains_in_progress(
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    db: Database,
+) -> None:
+    cfg = _retry_settings(monkeypatch, max_retries=1)
+    monkeypatch.setattr("robomp.queue._reap_slot", lambda uid: None)
+    pool = WorkerPool(
+        settings=cfg,
+        db=db,
+        github=_StubGitHub(),  # type: ignore[arg-type]
+        sandbox=_StubSandbox(),  # type: ignore[arg-type]
+        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
+        slot_pool=SlotPool([2001]),
+    )
+    key = issue_key("octo/widget", 1)
+    _record(db)
+    db.upsert_issue(key=key, repo="octo/widget", number=1, state="reproducing")
+    db.log_tool_call(issue_key=key, tool="stale_tool", args={}, error="old failure")
+    db._conn.execute("UPDATE tool_calls SET ts='2000-01-01T00:00:00Z' WHERE tool='stale_tool'")
+
+    async def incomplete(*_args: object, **_kwargs: object) -> None:
+        db.log_tool_call(
+            issue_key=key,
+            tool="classify_issue",
+            args={"branch_slug": "farm/abc12345/fix-it"},
+            error="branch_slug must be kebab-case",
+        )
+
+    monkeypatch.setattr(pool, "_dispatch", incomplete)
+    row = db.claim_next_event()
+    assert row is not None and row.task_kind == "triage_issue"
+    await pool._run_event(row)
+
+    event = db.get_event("d1")
+    assert event is not None and event.state == "queued"
+    assert "triage completed without an implementation outcome" in (event.last_error or "")
+    assert "classify_issue: branch_slug must be kebab-case" in (event.last_error or "")
+    assert "stale_tool" not in (event.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_triage_run_accepts_responded_issue(
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    db: Database,
+) -> None:
+    cfg = _retry_settings(monkeypatch, max_retries=1)
+    monkeypatch.setattr("robomp.queue._reap_slot", lambda uid: None)
+    pool = WorkerPool(
+        settings=cfg,
+        db=db,
+        github=_StubGitHub(),  # type: ignore[arg-type]
+        sandbox=_StubSandbox(),  # type: ignore[arg-type]
+        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
+        slot_pool=SlotPool([2001]),
+    )
+    key = issue_key("octo/widget", 1)
+    _record(db)
+    db.upsert_issue(key=key, repo="octo/widget", number=1, state="responded")
+
+    async def complete(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(pool, "_dispatch", complete)
+    row = db.claim_next_event()
+    assert row is not None and row.task_kind == "triage_issue"
+    await pool._run_event(row)
+
+    event = db.get_event("d1")
+    assert event is not None and event.state == "done"

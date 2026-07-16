@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -284,7 +285,6 @@ def test_guarded_push_branch_rev_parse_runs_via_repo_command_and_passes_slot_uid
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import subprocess
-    from dataclasses import replace
 
     from robomp.git_ops import PushResult
 
@@ -1225,7 +1225,6 @@ def test_impl_gate_rejects_unauthorized_non_auto_classification_before_repo_comm
 def test_impl_gate_allows_authorized_non_auto_classification_to_reach_pr_validation(
     db: Database, tmp_path: Path, classification: str
 ) -> None:
-    from dataclasses import replace
 
     bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)))
     db.set_issue_classification(bindings.issue_key, classification)
@@ -1246,7 +1245,6 @@ def test_impl_gate_allows_authorized_non_auto_classification_to_reach_pr_validat
 def test_impl_gate_allows_authorized_non_auto_classification_push_to_reach_repo_commands(
     db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, classification: str
 ) -> None:
-    from dataclasses import replace
 
     calls: list[list[str] | tuple[str, ...]] = []
 
@@ -1472,7 +1470,15 @@ def _init_git_repo(repo_dir: Path, branch: str) -> None:
     )
 
 
-def test_classify_issue_renames_branch_when_slug_provided(db: Database, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "branch_slug",
+    ("fix-windows-env-colon-vars", "farm/abc12345/fix-windows-env-colon-vars"),
+)
+def test_classify_issue_renames_branch_when_slug_provided(
+    db: Database,
+    tmp_path: Path,
+    branch_slug: str,
+) -> None:
     bindings, loop, t = _bindings(
         db,
         tmp_path,
@@ -1489,7 +1495,7 @@ def test_classify_issue_renames_branch_when_slug_provided(db: Database, tmp_path
                 "primary": "bug",
                 "priority": "prio:p1",
                 "rationale": "powershell env colon-var parsing on win is broken",
-                "branch_slug": "fix-windows-env-colon-vars",
+                "branch_slug": branch_slug,
             },
             _ctx(),
         )
@@ -3532,6 +3538,8 @@ def test_forge_post_comment_appends_suffix_and_schedules_for_question(db: Databa
     assert row.comment_id == 4242
     # `_stub_issue()` opens the issue as `alice`.
     assert row.issue_author == "alice"
+    issue = db.get_issue(bindings.issue_key)
+    assert issue is not None and issue.state == "responded"
 
 
 def test_forge_post_comment_skips_suffix_for_non_question(db: Database, tmp_path: Path) -> None:
@@ -3559,6 +3567,28 @@ def test_forge_post_comment_skips_suffix_for_non_question(db: Database, tmp_path
 
     assert captured["body"] == {"body": "Here's the diagnosis"}
     assert db.get_pending_closure(bindings.issue_key) is None
+
+
+@pytest.mark.parametrize("classification", ["enhancement", "proposal"])
+def test_forge_post_comment_keeps_authorized_implementation_active(
+    db: Database,
+    tmp_path: Path,
+    classification: str,
+) -> None:
+
+    captured: dict[str, Any] = {}
+    transport = httpx.MockTransport(_question_handler(captured))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    db.set_issue_classification(bindings.issue_key, classification)
+    bindings = replace(bindings, settings=_stub_settings(), impl_authorized=True)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "forge_post_comment")
+        tool.execute({"body": "Implementation started"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+
+    issue = db.get_issue(bindings.issue_key)
+    assert issue is not None and issue.state == "reproducing"
 
 
 def test_forge_post_comment_skips_suffix_when_target_differs_from_origin(db: Database, tmp_path: Path) -> None:

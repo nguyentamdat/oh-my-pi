@@ -54,8 +54,13 @@ from robomp.sandbox import SandboxManager
 log = logging.getLogger(__name__)
 
 
-def _gitlab_issue_url(base_url: str | None, repo: str | None, number: int | None) -> str | None:
-    """Build a credential-free GitLab issue URL from persisted issue identity."""
+def _gitlab_item_url(
+    base_url: str | None,
+    repo: str | None,
+    collection: str,
+    number: int | None,
+) -> str | None:
+    """Build a credential-free GitLab item URL from persisted identity."""
     if base_url is None or repo is None or number is None:
         return None
     parsed = urlsplit(base_url)
@@ -69,8 +74,27 @@ def _gitlab_issue_url(base_url: str | None, repo: str | None, number: int | None
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     netloc = hostname if port is None else f"{hostname}:{port}"
-    path = f"{parsed.path.rstrip('/')}/{quote(repo, safe='/')}/-/issues/{number}"
+    path = f"{parsed.path.rstrip('/')}/{quote(repo, safe='/')}/-/{collection}/{number}"
     return urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
+def _status_issue_url(settings: Settings, key: str, repo: str, number: int) -> str | None:
+    """Build a forge-aware browser URL from the issue's persisted instance identity."""
+    if key.startswith(f"{settings.gitlab_instance_id}:"):
+        return _gitlab_item_url(settings.gitlab_base_url, repo, "issues", number)
+    if key.startswith(f"{settings.github_instance_id}:") or ":" not in key:
+        return f"https://github.com/{quote(repo, safe='/')}/issues/{number}"
+    return None
+
+
+def _status_change_url(settings: Settings, key: str, repo: str, number: int | None) -> str | None:
+    if number is None:
+        return None
+    if key.startswith(f"{settings.gitlab_instance_id}:"):
+        return _gitlab_item_url(settings.gitlab_base_url, repo, "merge_requests", number)
+    if key.startswith(f"{settings.github_instance_id}:") or ":" not in key:
+        return f"https://github.com/{quote(repo, safe='/')}/pull/{number}"
+    return None
 
 
 def _routing_flows_payload(rows: list[RoutingStatusRow], gitlab_base_url: str | None) -> list[dict[str, Any]]:
@@ -84,7 +108,12 @@ def _routing_flows_payload(rows: list[RoutingStatusRow], gitlab_base_url: str | 
                 "source_key": row.source_canonical_key,
                 "source_repo": row.source_repo,
                 "source_number": row.source_number,
-                "source_url": _gitlab_issue_url(gitlab_base_url, row.source_repo, row.source_number),
+                "source_url": _gitlab_item_url(
+                    gitlab_base_url,
+                    row.source_repo,
+                    "issues",
+                    row.source_number,
+                ),
                 "action": row.action,
                 "explicit": row.explicit,
                 "created_at": row.created_at,
@@ -107,7 +136,12 @@ def _routing_flows_payload(rows: list[RoutingStatusRow], gitlab_base_url: str | 
                 "canonical_key": row.target_canonical_key,
                 "repo": row.target_repo,
                 "number": row.target_number,
-                "url": _gitlab_issue_url(gitlab_base_url, row.target_repo, row.target_number),
+                "url": _gitlab_item_url(
+                    gitlab_base_url,
+                    row.target_repo,
+                    "issues",
+                    row.target_number,
+                ),
                 "delivery_id": row.target_delivery_id,
                 "task_kind": row.target_task_kind,
                 "state": row.target_state or "planned",
@@ -1200,7 +1234,9 @@ def create_app(
                         "repo": r.repo,
                         "number": r.number,
                         "branch": r.branch,
+                        "url": _status_issue_url(cfg, r.key, r.repo, r.number),
                         "pr_number": r.pr_number,
+                        "pr_url": _status_change_url(cfg, r.key, r.repo, r.pr_number),
                         "state": r.state,
                         "classification": r.classification,
                         "updated_at": r.updated_at,

@@ -255,9 +255,11 @@ def test_status_contract(env, monkeypatch: pytest.MonkeyPatch) -> None:
             assert set(issue_row.keys()) == {
                 "key",
                 "repo",
+                "url",
                 "number",
                 "branch",
                 "pr_number",
+                "pr_url",
                 "state",
                 "classification",
                 "updated_at",
