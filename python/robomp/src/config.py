@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     gh_proxy_git_timeout_seconds: float = Field(60.0, alias="ROBOMP_GH_PROXY_GIT_TIMEOUT_SECONDS")
 
     # Model selection
-    model: str = Field("openai-codex/gpt-5.6-sol", alias="ROBOMP_MODEL")
+    model: str = Field("openai-codex/gpt-5.6-terra", alias="ROBOMP_MODEL")
     provider: str | None = Field(None, alias="ROBOMP_PROVIDER")
     thinking_level: ThinkingLevel = Field("high", alias="ROBOMP_THINKING")
 
