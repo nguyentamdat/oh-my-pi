@@ -279,7 +279,7 @@ class RoutingDecisionRow:
 
 @dataclass(slots=True, frozen=True)
 class RoutingStatusRow:
-    """One source decision with an optional planned child and its synthetic event."""
+    """One source decision with an optional child and its effective activation event."""
 
     source_canonical_key: str
     source_repo: str | None
