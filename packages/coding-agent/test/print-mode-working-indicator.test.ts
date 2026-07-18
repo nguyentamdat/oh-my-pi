@@ -7,6 +7,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/print-mode";
 import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { type PlanProposalHandler, PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-coding-agent/tools/resolve";
 
 function makeAssistantMessage(text: string): AssistantMessage {
 	const timestamp = Date.now();
@@ -36,6 +37,10 @@ interface DelayedSession {
 	resolvePrompt: () => void;
 	getPlanModeAtPrompt: () => PlanModeState | undefined;
 	getModeChanges: () => Array<{ mode: string; data?: Record<string, unknown> }>;
+	getPlanProposalHandler: () => PlanProposalHandler | undefined;
+	getCurrentPlanMode: () => PlanModeState | undefined;
+	emit: (event: AgentSessionEvent) => void;
+	getAbortCalls: () => number;
 }
 
 function createDelayedSession(
@@ -50,6 +55,9 @@ function createDelayedSession(
 	let planModeAtPrompt: PlanModeState | undefined;
 	let enabledToolNames = ["read"];
 	const modeChanges: Array<{ mode: string; data?: Record<string, unknown> }> = [];
+	let planProposalHandler: PlanProposalHandler | undefined;
+	let subscriber: ((event: AgentSessionEvent) => void) | undefined;
+	let abortCalls = 0;
 
 	const session = {
 		state: { messages },
@@ -79,13 +87,28 @@ function createDelayedSession(
 		setPlanModeState: (state: PlanModeState | undefined) => {
 			planModeState = state;
 		},
+		preparePlanForReview: async (title: string) => {
+			const details = { planFilePath: `local://${title}-plan.md`, title, planExists: true };
+			return { content: [{ type: "text" as const, text: "Plan ready for review." }], details };
+		},
+		setPlanProposalHandler: (handler: PlanProposalHandler | null) => {
+			planProposalHandler = handler ?? undefined;
+		},
 		resolveRoleModelWithThinking: () => ({
 			model: undefined,
 			thinkingLevel: undefined,
 			explicitThinkingLevel: false,
 		}),
 		extensionRunner: undefined,
-		subscribe: () => () => {},
+		markPlanInternalAbortPending: () => {},
+		clearPlanInternalAbortPending: () => {},
+		abort: async () => {
+			abortCalls++;
+		},
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			subscriber = listener;
+			return () => {};
+		},
 		prompt: async () => {
 			planModeAtPrompt = planModeState;
 			if (advisorDrainPrepared) throw new Error("headless advisor delivery armed before prompt completion");
@@ -109,6 +132,10 @@ function createDelayedSession(
 		resolvePrompt,
 		getPlanModeAtPrompt: () => planModeAtPrompt,
 		getModeChanges: () => modeChanges,
+		getPlanProposalHandler: () => planProposalHandler,
+		getCurrentPlanMode: () => planModeState,
+		emit: event => subscriber?.(event),
+		getAbortCalls: () => abortCalls,
 	};
 }
 
@@ -155,6 +182,36 @@ describe("print mode working indicator", () => {
 				planFilePath: "local://PLAN.md",
 			});
 			expect(delayed.getModeChanges()).toEqual([{ mode: "plan", data: { planFilePath: "local://PLAN.md" } }]);
+			const handler = delayed.getPlanProposalHandler();
+			if (!handler) throw new Error("Expected print plan proposal handler");
+			const proposal = await handler("hello");
+			expect(proposal).toMatchObject({
+				content: [{ type: "text", text: "Plan ready for review." }],
+				details: { planFilePath: "local://hello-plan.md", title: "hello", planExists: true },
+			});
+			expect(delayed.getCurrentPlanMode()).toMatchObject({ planFilePath: "local://hello-plan.md" });
+			expect(delayed.getModeChanges()).toEqual([
+				{ mode: "plan", data: { planFilePath: "local://PLAN.md" } },
+				{ mode: "plan", data: { planFilePath: "local://hello-plan.md" } },
+			]);
+			delayed.emit({
+				type: "tool_execution_end",
+				toolCallId: "proposal",
+				toolName: "write",
+				result: {
+					content: proposal.content,
+					details: {
+						xdev: {
+							tool: PROPOSE_DEVICE_NAME,
+							mode: "execute",
+							args: { title: "hello" },
+							inner: proposal.details,
+						},
+					},
+				},
+			});
+			await Promise.resolve();
+			expect(delayed.getAbortCalls()).toBe(1);
 		} finally {
 			delayed.resolvePrompt();
 			await run;

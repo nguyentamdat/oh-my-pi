@@ -264,7 +264,7 @@ import {
 	estimateToolSchemaTokens,
 } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
-import { resolveApprovedPlan } from "../plan-mode/approved-plan";
+import { type PlanApprovalDetails, resolveApprovedPlan } from "../plan-mode/approved-plan";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -2567,6 +2567,24 @@ export class AgentSession {
 		this.setPlanProposalHandler(title => this.#approvePlanYoloProposal(title));
 	}
 
+	/** Validate the active plan artifact and shape an `xd://propose` result for review-mode hosts. */
+	async preparePlanForReview(title: string): Promise<AgentToolResult<PlanApprovalDetails>> {
+		const state = this.getPlanModeState();
+		if (!state?.enabled) {
+			throw new ToolError("Plan mode is not active.");
+		}
+		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
+			suppliedTitle: title,
+			statePlanFilePath: state.planFilePath,
+			readPlan: url => this.#readPlanFile(url),
+			listPlanFiles: () => this.#listPlanFiles(),
+		});
+		return {
+			content: [{ type: "text", text: "Plan ready for review." }],
+			details: { planFilePath, title: resolvedTitle, planExists: true },
+		};
+	}
+
 	/**
 	 * Plan-proposal handler while PlanYolo's plan phase is active. Auto-approves
 	 * the instant the model writes the plan slug/title to `xd://propose` — no
@@ -2587,8 +2605,8 @@ export class AgentSession {
 		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
 			suppliedTitle: title,
 			statePlanFilePath: state.planFilePath,
-			readPlan: url => this.#readPlanYoloFile(url),
-			listPlanFiles: () => this.#listPlanYoloFiles(),
+			readPlan: url => this.#readPlanFile(url),
+			listPlanFiles: () => this.#listPlanFiles(),
 		});
 		this.setPlanModeState(undefined);
 		const previousTools = this.#planYoloPreviousTools;
@@ -2623,7 +2641,7 @@ export class AgentSession {
 		};
 	}
 
-	async #readPlanYoloFile(planFilePath: string): Promise<string | null> {
+	async #readPlanFile(planFilePath: string): Promise<string | null> {
 		const resolvedPath = planFilePath.startsWith("local:")
 			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), this.#localProtocolOptions())
 			: resolveToCwd(planFilePath, this.sessionManager.getCwd());
@@ -2637,7 +2655,7 @@ export class AgentSession {
 
 	/** `local://` URLs of plan files in the session-local root, newest first —
 	 *  a fallback for `resolveApprovedPlan` when the agent dropped `extra.title`. */
-	async #listPlanYoloFiles(): Promise<string[]> {
+	async #listPlanFiles(): Promise<string[]> {
 		const localRoot = resolveLocalUrlToPath("local://", this.#localProtocolOptions());
 		try {
 			const entries = await fs.promises.readdir(localRoot, { withFileTypes: true });

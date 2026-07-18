@@ -8,7 +8,6 @@ import {
 	type Agent,
 	AgentBusyError,
 	type AgentMessage,
-	type AgentToolResult,
 	EventLoopKeepalive,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
@@ -89,12 +88,7 @@ import {
 	MCP_CONNECTION_STATUS_EVENT_CHANNEL,
 	type McpConnectionStatusEvent,
 } from "../mcp/startup-events";
-import {
-	humanizePlanTitle,
-	type PlanApprovalDetails,
-	resolveApprovedPlan,
-	resolvePlanTitle,
-} from "../plan-mode/approved-plan";
+import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
 import { resolvePlanModelTransition } from "../plan-mode/model-transition";
 import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
 import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
@@ -129,7 +123,6 @@ import {
 	setActiveTodoDescriptionsProvider,
 	todoMatchesAnyDescription,
 } from "../tools/todo";
-import { ToolError } from "../tools/tool-errors";
 import { vocalizer } from "../tts/vocalizer";
 import { renderTreeList } from "../tui/tree-list";
 import { copyToClipboard } from "../utils/clipboard";
@@ -2380,7 +2373,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			workflow: options?.workflow ?? "parallel",
 			reentry: this.#planModeHasEntered,
 		});
-		this.session.setPlanProposalHandler?.(title => this.#handlePlanProposal(title));
+		this.session.setPlanProposalHandler?.(title => this.session.preparePlanForReview(title));
 		if (this.session.isStreaming) {
 			await this.session.sendPlanModeContext({ deliverAs: "steer" });
 		}
@@ -2389,33 +2382,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#updatePlanModeStatus();
 		this.sessionManager.appendModeChange("plan", { planFilePath });
 		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
-	}
-
-	/** Plan-proposal handler registered while plan mode is active. The agent
-	 *  submits the finalized plan by writing the chosen `<slug>`/title to
-	 *  `xd://propose`; this handler validates the plan file exists, normalizes
-	 *  the title, and shapes the payload that `event-controller` forwards to
-	 *  `handlePlanApproval`. */
-	async #handlePlanProposal(title: string): Promise<AgentToolResult<unknown>> {
-		const state = this.session.getPlanModeState?.();
-		if (!state?.enabled) {
-			throw new ToolError("Plan mode is not active.");
-		}
-		const { planFilePath, title: resolvedTitle } = await resolveApprovedPlan({
-			suppliedTitle: title,
-			statePlanFilePath: state.planFilePath,
-			readPlan: url => this.#readPlanFile(url),
-			listPlanFiles: () => this.#listLocalPlanFiles(),
-		});
-		const details: PlanApprovalDetails = {
-			planFilePath,
-			title: resolvedTitle,
-			planExists: true,
-		};
-		return {
-			content: [{ type: "text" as const, text: "Plan ready for approval." }],
-			details,
-		};
 	}
 
 	async #restorePlanPreviousModel(prev: { model: Model; thinkingLevel?: ConfiguredThinkingLevel }): Promise<void> {
