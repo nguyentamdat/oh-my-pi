@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
 /** Maximum UTF-8 size of one newline-delimited RPC frame, including the newline. */
@@ -55,11 +56,37 @@ function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
 	return value;
 }
 
-function compactTerminalFrame(frame: object, streamedMessageCount: number): object {
+function jsonSnapshot(value: unknown): unknown {
+	const json = JSON.stringify(value);
+	return json === undefined ? undefined : JSON.parse(json);
+}
+
+function encodedMessageSnapshot(encoded: string): { message: unknown } | undefined {
+	const frame = JSON.parse(encoded);
+	return isRecord(frame) && frame.type === "message_end" && Object.hasOwn(frame, "message")
+		? { message: frame.message }
+		: undefined;
+}
+
+function compactTerminalFrame(
+	frame: object,
+	streamedMessageCount: number,
+	streamedMessages?: readonly unknown[],
+): object {
 	if (!isRecord(frame) || frame.type !== "agent_end" || !Array.isArray(frame.messages)) return frame;
-	const streamed = Number.isSafeInteger(streamedMessageCount)
+	let streamed = Number.isSafeInteger(streamedMessageCount)
 		? Math.min(Math.max(0, streamedMessageCount), frame.messages.length)
 		: 0;
+	if (streamedMessages) {
+		streamed = 0;
+		const limit = Math.min(streamedMessages.length, frame.messages.length);
+		while (
+			streamed < limit &&
+			isDeepStrictEqual(streamedMessages[streamed], jsonSnapshot(frame.messages[streamed]))
+		) {
+			streamed++;
+		}
+	}
 	return {
 		...frame,
 		messages: frame.messages.slice(streamed),
@@ -93,8 +120,8 @@ function overflowFrame(frame: object): object {
 }
 
 /** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
-export function encodeRpcFrame(frame: object, streamedMessageCount = 0): string {
-	const compacted = compactTerminalFrame(frame, streamedMessageCount);
+export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamedMessages?: readonly unknown[]): string {
+	const compacted = compactTerminalFrame(frame, streamedMessageCount, streamedMessages);
 	let json = JSON.stringify(compacted);
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 	if (isRecord(compacted) && compacted.type === "response") {
@@ -111,14 +138,16 @@ export function encodeRpcFrame(frame: object, streamedMessageCount = 0): string 
 
 /** Stateful encoder that tracks which messages a client has already received. */
 export class RpcFrameEncoder {
-	#streamedMessageCount = 0;
+	#streamedMessages: unknown[] = [];
 
 	encode(frame: object): string {
-		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessageCount = 0;
-		const encoded = encodeRpcFrame(frame, this.#streamedMessageCount);
+		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessages = [];
+		const encoded = encodeRpcFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
 		if (!isRecord(frame)) return encoded;
-		if (frame.type === "message_end") this.#streamedMessageCount++;
-		else if (frame.type === "agent_end") this.#streamedMessageCount = 0;
+		if (frame.type === "message_end") {
+			const snapshot = encodedMessageSnapshot(encoded);
+			if (snapshot) this.#streamedMessages.push(snapshot.message);
+		} else if (frame.type === "agent_end") this.#streamedMessages = [];
 		return encoded;
 	}
 }

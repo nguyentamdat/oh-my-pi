@@ -23,7 +23,7 @@ describe("RPC frame encoding", () => {
 		expect(decoded).toEqual({ type: "agent_end", messages: [], messageCount: 10_000, telemetry: { stepCount: 42 } });
 	});
 
-	it("retains terminal messages that were not emitted as message events", () => {
+	it("retains a terminal error emitted only by agent_end after earlier message events", () => {
 		const streamed = { role: "assistant", content: [{ type: "text", text: "done" }] };
 		const aborted = {
 			role: "assistant",
@@ -34,12 +34,72 @@ describe("RPC frame encoding", () => {
 		const encoder = new RpcFrameEncoder();
 		encoder.encode({ type: "agent_start" });
 		encoder.encode({ type: "message_end", message: streamed });
-		const decoded = decode(encoder.encode({ type: "agent_end", messages: [streamed, aborted] }));
+		const decoded = decode(encoder.encode({ type: "agent_end", messages: [aborted] }));
 
 		expect(decoded).toEqual({
 			type: "agent_end",
 			messages: [aborted],
-			messageCount: 2,
+			messageCount: 1,
+		});
+	});
+
+	it("compacts stateful agent_end messages that match earlier message events", () => {
+		const streamed = { role: "assistant", content: [{ type: "text", text: "done" }] };
+		const encoder = new RpcFrameEncoder();
+		encoder.encode({ type: "agent_start" });
+		encoder.encode({ type: "message_end", message: streamed });
+		const decoded = decode(
+			encoder.encode({
+				type: "agent_end",
+				messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+			}),
+		);
+
+		expect(decoded).toEqual({
+			type: "agent_end",
+			messages: [],
+			messageCount: 1,
+		});
+	});
+
+	it("matches terminal messages in the JSON shape sent by message_end", () => {
+		const encoder = new RpcFrameEncoder();
+		encoder.encode({ type: "agent_start" });
+		encoder.encode({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				disabledFeatures: undefined,
+				toolCallAbortMessages: undefined,
+			},
+		});
+		const decoded = decode(
+			encoder.encode({
+				type: "agent_end",
+				messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+			}),
+		);
+
+		expect(decoded).toEqual({
+			type: "agent_end",
+			messages: [],
+			messageCount: 1,
+		});
+	});
+
+	it("does not let later mutation rewrite the message_end snapshot", () => {
+		const streamed = { role: "assistant", content: [{ type: "text", text: "before" }] };
+		const encoder = new RpcFrameEncoder();
+		encoder.encode({ type: "agent_start" });
+		encoder.encode({ type: "message_end", message: streamed });
+		streamed.content[0].text = "after";
+		const decoded = decode(encoder.encode({ type: "agent_end", messages: [streamed] }));
+
+		expect(decoded).toEqual({
+			type: "agent_end",
+			messages: [streamed],
+			messageCount: 1,
 		});
 	});
 
