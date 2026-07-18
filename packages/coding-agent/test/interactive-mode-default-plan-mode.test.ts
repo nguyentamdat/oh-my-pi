@@ -247,6 +247,23 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(session?.getPlanModeState()).toBeUndefined();
 	});
 
+	it("preserves the restored model when resuming an active plan session", async () => {
+		const created = createHarness(
+			Settings.isolated({
+				"compaction.enabled": false,
+				modelRoles: { plan: "anthropic/claude-sonnet-4-6" },
+			}),
+		);
+		created.sessionManager.appendModelChange("anthropic/claude-sonnet-4-5");
+		created.sessionManager.appendModeChange("plan", { planFilePath: "local://PLAN.md" });
+		created.sessionManager.appendMessage({ role: "user", content: "prior plan turn", timestamp: Date.now() });
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(session?.model?.id).toBe("claude-sonnet-4-5");
+	});
+
 	it("enters plan mode for a fresh session that carries only startup metadata", async () => {
 		// createAgentSession appends model_change / thinking_level_change for a
 		// brand-new session before init(); those are not conversation history, so
