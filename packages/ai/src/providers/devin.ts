@@ -244,10 +244,17 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 								// The full protobuf also contains the system prompt and tool
 								// schemas, which history maintenance cannot shrink. Re-encode
 								// only the repeated history field before choosing recovery.
+								const lastUserIndex = context.messages.findLastIndex(
+									m => m.role === "user" || m.role === "developer",
+								);
+								const shrinkablePrompts =
+									lastUserIndex !== -1
+										? request.chatMessagePrompts.slice(0, lastUserIndex)
+										: request.chatMessagePrompts;
 								const historyBytes = toBinary(
 									GetChatMessageRequestSchema,
 									create(GetChatMessageRequestSchema, {
-										chatMessagePrompts: request.chatMessagePrompts,
+										chatMessagePrompts: shrinkablePrompts,
 									}),
 								).byteLength;
 								if (historyBytes >= LARGE_HISTORY_RECOVERY_BYTES) {

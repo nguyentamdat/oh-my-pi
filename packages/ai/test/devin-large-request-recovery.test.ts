@@ -135,4 +135,53 @@ describe("streamDevin large request recovery", () => {
 
 		expect(AIError.is(result.errorId, AIError.Flag.ContextOverflow)).toBe(false);
 	});
+
+	it("keeps the trailer transient for a huge active turn user message with no prior history", async () => {
+		const result = await runTrailerError(
+			{
+				messages: [
+					{
+						role: "user" as const,
+						content: "u".repeat(520 * 1024),
+						timestamp: 1,
+					},
+				],
+			},
+			"invalid_argument",
+			"an internal error occurred (trace ID: huge-user-request)",
+		);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("trace ID: huge-user-request");
+		expect(AIError.is(result.errorId, AIError.Flag.ContextOverflow)).toBe(false);
+		expect(AIError.is(result.errorId, AIError.Flag.Transient)).toBe(true);
+	});
+
+	it("classifies as context overflow if there is huge eligible prior history before the active turn user message", async () => {
+		const result = await runTrailerError(
+			{
+				messages: [
+					{
+						role: "toolResult" as const,
+						toolCallId: "read-prior",
+						toolName: "read",
+						content: [{ type: "text" as const, text: "p".repeat(520 * 1024) }],
+						isError: false,
+						timestamp: 1,
+					},
+					{
+						role: "user" as const,
+						content: "small user prompt",
+						timestamp: 2,
+					},
+				],
+			},
+			"invalid_argument",
+			"an internal error occurred (trace ID: prior-history-overflow)",
+		);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("trace ID: prior-history-overflow");
+		expect(AIError.is(result.errorId, AIError.Flag.ContextOverflow)).toBe(true);
+	});
 });
