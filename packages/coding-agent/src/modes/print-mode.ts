@@ -115,14 +115,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// the first prompt; persisting the mode_change also lets a later interactive
 	// attachment restore and review the generated plan.
 	let abortAfterPlanProposal = false;
-	const hasConversationContext = session.sessionManager.buildSessionContext().messages.length > 0;
-	const hasExplicitMode = session.sessionManager.getEntries().some(entry => entry.type === "mode_change");
-	if (
-		!hasConversationContext &&
-		!hasExplicitMode &&
+	const planDefaultArmed =
 		session.settings.get("plan.defaultOnStartup") &&
-		session.settings.get("plan.enabled")
-	) {
+		session.settings.get("plan.enabled") &&
+		session.sessionManager.buildSessionContext().messages.length === 0 &&
+		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change");
+	if (planDefaultArmed) {
 		const planFilePath = session.getPlanReferencePath() || "local://PLAN.md";
 		const previousTools = session.getEnabledToolNames();
 		const planTools = session.hasBuiltInTool("write") ? [...new Set([...previousTools, "write"])] : previousTools;
