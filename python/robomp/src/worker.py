@@ -13,6 +13,7 @@ scheduled onto the parent loop complete (`asyncio.run_coroutine_threadsafe`).
 from __future__ import annotations
 
 import asyncio
+import grp
 import logging
 import os
 import shutil

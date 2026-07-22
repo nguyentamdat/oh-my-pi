@@ -15,7 +15,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from robomp import github_events
+from robomp import github_events, issue_index
 from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings, get_settings
 from robomp.dashboard import render_index, static_dir, tail_jsonl
@@ -38,6 +38,7 @@ from robomp.github_client import GitHubError, IssueSummary
 from robomp.gitlab_compat import GitLabIssueBackend
 from robomp.gitlab_events import GitLabWebhookAdapter
 from robomp.gitlab_proxy_client import GitLabProxyClient, GitLabProxyGitTransport
+from robomp.issue_index import IssueIndexSync
 from robomp.manual_triage import (
     InvalidIssueRef,
     ManualTriageConflict,
@@ -526,6 +527,7 @@ def _build_state(
         ),
     )
     autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
+    index_sync = IssueIndexSync(settings=settings, db=db, github=github)
     return {
         "settings": settings,
         "db": db,
@@ -538,6 +540,7 @@ def _build_state(
         "issue_browse_cache": _IssueBrowseCache(),
         "webhook_adapters": _build_webhook_adapters(settings, webhook_adapters),
         "autoclose": autoclose,
+        "issue_index_sync": index_sync,
     }
 
 
@@ -558,9 +561,12 @@ def create_app(
         await pool.start()
         autoclose: AutocloseScheduler = app.state.bag["autoclose"]
         await autoclose.start()
+        index_sync: IssueIndexSync = app.state.bag["issue_index_sync"]
+        await index_sync.start()
         try:
             yield
         finally:
+            await index_sync.stop()
             await autoclose.stop()
             try:
                 await pool.stop(
@@ -615,6 +621,15 @@ def create_app(
             payload=payload,
             allowlist=cfg.repo_allowlist,
         )
+        # Keep the local search index fresh from every delivery that carries an
+        # issue/PR object — including ones the router will skip.
+        if x_github_event in ("issues", "issue_comment") or x_github_event.startswith("pull_request"):
+            repo_full = str((payload.get("repository") or {}).get("full_name") or "")
+            if repo_full and repo_full in cfg.repo_allowlist:
+                try:
+                    issue_index.ingest_webhook_payload(db, repo_full, x_github_event, payload)
+                except Exception:
+                    log.exception("issue index webhook ingest failed", extra={"repo": repo_full})
 
         def _resolve(repo_full: str, pr_number: int) -> str | None:
             row = db.find_issue_by_pr(repo_full, pr_number)
