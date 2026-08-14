@@ -13,6 +13,8 @@
 import { type Type, type } from "@oh-my-pi/omptype";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AuthStorage, StoredCredentialBlock } from "../auth-storage";
+import { getOAuthProviders } from "../registry";
+import type { OAuthProviderId } from "../registry/oauth/types";
 import { parseBind } from "../utils/parse-bind";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
@@ -44,6 +46,133 @@ import {
 import { getAuthBrokerWireSchemas } from "./wire-schema-resource";
 
 const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
+const LOGIN_SESSION_TTL_MS = 10 * 60_000;
+
+type LoginSessionStatus = "starting" | "waiting" | "complete" | "error" | "cancelled";
+type LoginSession = {
+	id: string;
+	provider: OAuthProviderId;
+	createdAt: number;
+	status: LoginSessionStatus;
+	auth?: { url: string; launchUrl?: string; instructions?: string };
+	prompt?: { message: string; placeholder?: string };
+	error?: string;
+	resolveInput?: (value: string) => void;
+	abort: AbortController;
+};
+
+/** Runs canonical provider login callbacks as broker-owned, short-lived sessions. */
+class LoginSessionManager {
+	#sessions = new Map<string, LoginSession>();
+
+	constructor(private readonly storage: AuthStorage) {}
+
+	providers() {
+		return getOAuthProviders().map(({ id, name, available, storeCredentialsAs }) => ({
+			id,
+			name,
+			available,
+			storeCredentialsAs,
+		}));
+	}
+
+	start(provider: string): LoginSession {
+		const info = getOAuthProviders().find(candidate => candidate.id === provider);
+		if (!info?.available) throw new Error(`OAuth provider unavailable: ${provider}`);
+		const session: LoginSession = {
+			id: crypto.randomUUID(),
+			provider: info.id,
+			createdAt: Date.now(),
+			status: "starting",
+			abort: new AbortController(),
+		};
+		this.#sessions.set(session.id, session);
+		void this.#run(session);
+		return session;
+	}
+
+	get(id: string): LoginSession | undefined {
+		const session = this.#sessions.get(id);
+		if (session && Date.now() - session.createdAt > LOGIN_SESSION_TTL_MS && session.status !== "complete")
+			this.cancel(id);
+		return this.#sessions.get(id);
+	}
+
+	submit(id: string, value: string): LoginSession {
+		const session = this.get(id);
+		if (!session) throw new Error("Login session not found or expired");
+		if (!session.resolveInput) throw new Error("Login session is not waiting for input");
+		const resolve = session.resolveInput;
+		session.resolveInput = undefined;
+		session.prompt = undefined;
+		session.status = "waiting";
+		resolve(value);
+		return session;
+	}
+
+	cancel(id: string): void {
+		const session = this.#sessions.get(id);
+		if (!session) return;
+		session.abort.abort("cancelled by operator");
+		session.resolveInput?.("");
+		session.resolveInput = undefined;
+		session.status = "cancelled";
+	}
+
+	close(): void {
+		for (const id of this.#sessions.keys()) this.cancel(id);
+	}
+
+	async #run(session: LoginSession): Promise<void> {
+		try {
+			await this.storage.login(session.provider, {
+				signal: session.abort.signal,
+				onAuth: auth => {
+					session.auth = auth;
+					session.status = "waiting";
+				},
+				onProgress: () => undefined,
+				onPrompt: prompt =>
+					new Promise<string>((resolve, reject) => {
+						if (session.abort.signal.aborted) return reject(session.abort.signal.reason);
+						session.prompt = prompt;
+						session.resolveInput = resolve;
+						session.status = "waiting";
+					}),
+				// A web UI cannot receive a Pod-loopback callback. Supplying the explicit
+				// escape hatch preserves each provider's own PKCE/state validation while
+				// allowing an operator to paste its final redirect URL when required.
+				onManualCodeInput: () =>
+					new Promise<string>((resolve, reject) => {
+						if (session.abort.signal.aborted) return reject(session.abort.signal.reason);
+						session.prompt = { message: "Paste the authorization code or complete redirect URL" };
+						session.resolveInput = resolve;
+						session.status = "waiting";
+					}),
+			});
+			if (session.status !== "cancelled") session.status = "complete";
+		} catch (error) {
+			if (session.status !== "cancelled") {
+				session.status = "error";
+				session.error = error instanceof Error ? error.message.slice(0, 240) : "Provider login failed";
+			}
+		} finally {
+			session.resolveInput = undefined;
+		}
+	}
+}
+
+function loginSessionResponse(session: LoginSession) {
+	return {
+		id: session.id,
+		provider: session.provider,
+		createdAt: session.createdAt,
+		status: session.status,
+		...(session.auth ? { auth: session.auth } : {}),
+		...(session.prompt ? { prompt: session.prompt } : {}),
+		...(session.error ? { error: session.error } : {}),
+	};
+}
 
 export interface AuthBrokerServerOptions {
 	/** Underlying credential storage (wraps the local SQLite store on the broker). */
@@ -146,6 +275,8 @@ const REFRESH_ROUTE = /^\/v1\/credential\/(\d+)\/refresh$/;
 const DISABLE_ROUTE = /^\/v1\/credential\/(\d+)\/disable$/;
 const BLOCK_ROUTE = /^\/v1\/credential\/(\d+)\/block$/;
 const BLOCKS_ROUTE = /^\/v1\/credential\/(\d+)\/blocks$/;
+const LOGIN_SESSION_ROUTE = /^\/v1\/login\/sessions\/([0-9a-f-]+)$/;
+const LOGIN_INPUT_ROUTE = /^\/v1\/login\/sessions\/([0-9a-f-]+)\/input$/;
 
 const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
@@ -656,7 +787,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 			});
 	refresher?.start();
 	const generationGate = new GenerationGate(opts.storage, externalChangePollMs);
-
+	const loginSessions = new LoginSessionManager(opts.storage);
 	const server = Bun.serve({
 		hostname: bind.hostname,
 		port: bind.port,
@@ -674,6 +805,49 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (!isAuthorized(req, tokens)) {
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });
 					return json(401, { error: "unauthorized" });
+				}
+				if (req.method === "GET" && pathname === "/v1/login/providers") {
+					return json(200, { providers: loginSessions.providers() });
+				}
+				if (req.method === "POST" && pathname === "/v1/login/sessions") {
+					const parsed = await parseBody(req, type({ "+": "reject", provider: "string" }));
+					if (!parsed.ok) return parsed.response;
+					try {
+						const session = loginSessions.start(parsed.data.provider);
+						logger.info("auth-broker login session started", {
+							peer,
+							provider: session.provider,
+							sessionId: session.id,
+						});
+						return json(201, loginSessionResponse(session));
+					} catch (error) {
+						return json(400, {
+							error: error instanceof Error ? error.message : "Failed to start provider login",
+						});
+					}
+				}
+				const loginSessionMatch = req.method === "GET" ? pathname.match(LOGIN_SESSION_ROUTE) : null;
+				if (loginSessionMatch) {
+					const session = loginSessions.get(loginSessionMatch[1]);
+					return session
+						? json(200, loginSessionResponse(session))
+						: json(404, { error: "Login session not found" });
+				}
+				const loginInputMatch = req.method === "POST" ? pathname.match(LOGIN_INPUT_ROUTE) : null;
+				if (loginInputMatch) {
+					const parsed = await parseBody(req, type({ "+": "reject", value: "string" }));
+					if (!parsed.ok) return parsed.response;
+					if (!parsed.data.value.trim()) return json(400, { error: "Login input cannot be empty" });
+					try {
+						return json(200, loginSessionResponse(loginSessions.submit(loginInputMatch[1], parsed.data.value)));
+					} catch (error) {
+						return json(409, { error: error instanceof Error ? error.message : "Login input rejected" });
+					}
+				}
+				const cancelLoginMatch = req.method === "DELETE" ? pathname.match(LOGIN_SESSION_ROUTE) : null;
+				if (cancelLoginMatch) {
+					loginSessions.cancel(cancelLoginMatch[1]);
+					return empty(204);
 				}
 				if (req.method === "GET" && pathname === "/v1/snapshot/stream") {
 					return serveSnapshotStream(req, opts.storage, refresher, peer, streamKeepaliveMs);
@@ -892,6 +1066,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 		close: async () => {
 			refresher?.stop();
 			generationGate.close();
+			loginSessions.close();
 			server.stop(true);
 		},
 	};
